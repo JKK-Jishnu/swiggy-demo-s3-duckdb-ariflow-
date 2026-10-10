@@ -46,23 +46,25 @@ Each job is **one self-contained file**, `activities/<job>/job.py`. It holds eve
 
 Jobs share no code, so changing one job can never break another.
 
-| # | Job (folder) | Runs | Input → Output | Alteryx equivalent |
-|---|---|---|---|---|
-| 1 | `gstr1_validation` | per batch, twice | sales register → `gstr1_validated` / `gstr1_final` + error Excel | Input → Select → Formula per rule → Filter → Output |
-| 2 | `gstr1_error_fixing` | per batch | register + client corrections → corrected register + change log | Join on Record ID → Formula → Output |
-| 3 | `gstr1_upload_file_creation` | per batch | final lines → GSTN upload Excel (b2b, b2cl, b2cs, cdnr, cdnur, exp, hsn, docs) | Filter → Summarize → Select → Output |
-| 4 | `combine_batches` | per month | all batches → `sales_combined` (duplicate flags) | Directory → Union → Formula |
-| 5 | `einv_vs_sales_reco` | per month | EINV (IRN) vs sales → reco Excel | Join ladder → Union J/L/R → Summarize |
-| 6 | `ewb_vs_sales_reco` | per month | EWB vs sales → reco Excel | Join ladder → Union J/L/R → Summarize |
-| 7 | `pr_validation` | per month | purchase register → `pr_validated` + error Excel | Input → Select → Formula per rule → Filter |
-| 8 | `gstr2b_consolidation` | per month | 2B workbooks (B2B + CDNR sheets) → `gstr2b_consolidated` | Dynamic Input → Select → Union |
-| 9 | `gstr2b_vs_pr_reco` | per month | 2B vs PR → reco Excel with ITC at risk | Join ladder → Union J/L/R → Summarize |
+| # | Job (folder) | Runs | Input → Output |
+|---|---|---|---|
+| 1 | `gstr1_validation` | per batch, twice | sales register → `gstr1_validated` / `gstr1_final` + error Excel |
+| 2 | `gstr1_error_fixing` | per batch | register + client corrections → corrected register + change log |
+| 3 | `gstr1_upload_file_creation` | per batch | final lines → GSTN upload Excel (b2b, b2cl, b2cs, cdnr, cdnur, exp, hsn, docs) |
+| 4 | `combine_batches` | per month | all batches → `sales_combined` (duplicate flags) |
+| 5 | `einv_vs_sales_reco` | per month | EINV (IRN) vs sales → reco Excel |
+| 6 | `ewb_vs_sales_reco` | per month | EWB vs sales → reco Excel |
+| 7 | `pr_validation` | per month | purchase register → `pr_validated` + error Excel |
+| 8 | `gstr2b_consolidation` | per month | 2B workbooks (B2B + CDNR sheets) → `gstr2b_consolidated` |
+| 9 | `gstr2b_vs_pr_reco` | per month | 2B vs PR → reco Excel with ITC at risk |
 
 The header of every `job.py` lists:
-- what the job does and its Alteryx equivalent
+- what the job does, and its steps in order
 - exact input and output paths
-- every validation rule (R01–R18 for GSTR-1, P01–P17 for purchases)
+- a **QUICK CHANGES** list: where to edit for the most common last-minute changes
 - how to run it
+
+The validation rules are listed in the job itself, in `RULES`: R01–R18 for GSTR-1 and P01–P17 for purchases.
 
 ### Reconciliation ladder (jobs 5, 6, 9)
 
@@ -216,35 +218,54 @@ python athena/athena.py query "SELECT * FROM swiggy_gst.v_itc_at_risk"
 
 ---
 
-## 7. Notes for Alteryx developers
+## 7. Making a quick change
 
-Every `job.py` follows the same layout:
-
+### How every job file is laid out
 ```
-header block      what / inputs / outputs / rules / how to run
-CONFIGURATION     column mappings (= Select tool), valid codes, tolerances
-STORAGE           read/write S3 or a local folder (= Input Data / Output Data tools)
-run()             STEP 1, STEP 2, ... - each step is one "tool", with a comment saying which
+header block      what it does, steps, inputs, outputs, QUICK CHANGES, how to run
+CONFIGURATION     column names, valid codes, tolerances, RULES / queries - most changes happen here
+STORAGE           read and write S3 (or a local folder) - never needs changing
+run()             STEP 1, STEP 2, ... in the same order as the header
 ```
 
-| Alteryx tool | In the code |
+Each step is one SQL statement that creates a named table: `cleaned`, then `checked`, then `validated`. To look at an intermediate result while testing, add this line after the step:
+```python
+print(con.execute("SELECT * FROM checked LIMIT 20").df())
+```
+
+### Where to edit
+
+| Change request | Where |
 |---|---|
-| Input Data | `store.read_excel_as_text(...)`. Every cell is read as text; numbers and dates are converted on purpose in the cleansing step |
-| Select | `COLUMN_MAP` (rename) and the final `SELECT` (column order and types) |
-| Data Cleansing | `trim`, `upper`, `NULLIF(x, '')`, `TRY_CAST(... AS DOUBLE)`, `try_strptime(...)` |
-| Formula | a SQL column: `CASE WHEN ... THEN ... END AS new_column` |
-| Filter | `WHERE ...` |
-| Join (J / L / R) | `JOIN`, plus `NOT IN (...)` for the unjoined left / right rows |
-| Summarize | `GROUP BY` with `sum()`, `count()`, `string_agg()` |
-| Union | `UNION ALL` / `pa.concat_tables` / `pd.concat` |
-| Output Data | `store.write_parquet(...)` (Athena) and `store.write_excel(...)` (client) |
+| Add / change / remove a GSTR-1 validation rule | `RULES` in `gstr1_validation/job.py`: one entry, nothing else |
+| Add / change / remove a purchase register rule | `RULES` in `pr_validation/job.py` |
+| Client renamed a column in their Excel | `COLUMN_MAP` of that job (left side = header in the client's file) |
+| New valid GST rate, UQC, state code | `VALID_...` lists in the validation jobs |
+| New Swiggy GSTIN on the purchase side | `SWIGGY_GSTINS` in `pr_validation/job.py` |
+| Rounding tolerance | `TOLERANCE_RS` / `AMOUNT_TOLERANCE_RS` |
+| A field the client may / may not correct | `CORRECTABLE_COLUMNS` in `gstr1_error_fixing/job.py` |
+| Change a GSTN upload sheet | its query in `SECTION_QUERIES` + its list in `SECTION_HEADERS` (`gstr1_upload_file_creation/job.py`) |
+| B2CL threshold | `B2CL_LIMIT_RS` in `gstr1_upload_file_creation/job.py` |
+| Change or add a reconciliation match level | STEP 3 of the reco job: one `match_level(...)` call per level |
+| Which sales lines are reconciled with EINV / EWB | `SALES_NEEDING_EINV` / `SALES_NEEDING_EWB` |
+| GSTN changed a GSTR-2B column header | `SHEET_LAYOUTS` in `gstr2b_consolidation/job.py` |
+| New output column | the final `SELECT` of the job, then the same column in `athena/tables/<table>.sql`, then `python athena/athena.py setup` |
 
-Each SQL step creates a named table (`CREATE TABLE cleaned AS ...`, `CREATE TABLE checked AS ...`), like the output anchor of a tool. To check an intermediate result while developing, `print(con.execute("SELECT * FROM checked LIMIT 20").df())`.
+### Example: add a GSTR-1 rule
+Add one entry to `RULES` in `activities/gstr1_validation/job.py`:
+```python
+{"code": "R19", "error": "Invoice value above Rs.10 crore - please confirm",
+ "check": "total_invoice_value <= 100000000",
+ "show": "total_invoice_value"},
+```
+The error count, the remark and the error file include the new rule automatically.
 
-**Adding a validation rule** (example in `gstr1_validation/job.py`):
-1. Add one line to the rules list in the header (`R19 ...`).
-2. Add one `COALESCE(<condition>, false) AS r19_ok` column in STEP 5.
-3. Add `+ CAST(NOT r19_ok AS INTEGER)` to `error_count` and a `CASE WHEN NOT r19_ok THEN 'R19 ...' END` line to the remark in STEP 6.
+### Test a change before it goes live
+```powershell
+aws s3 sync s3://swiggy-idt-poc-bucket/raw/202506 data/raw/202506      # copy one month (read only)
+python scripts/run_month.py --period 202506 --local-dir data            # run every job on the copy
+```
+The outputs are written to `data/intermediate/...` and `data/final/...`, and S3 is not touched. When the result looks right, re-run the month in Airflow or with `scripts/run_month.py` without `--local-dir`.
 
 ---
 

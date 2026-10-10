@@ -13,8 +13,12 @@ WHAT IT DOES
     is_duplicate_record_id  the same Record ID in more than one line
     is_duplicate_invoice    the same document type + invoice number in more than one line
 
-ALTERYX EQUIVALENT
-  Directory + Input Data (all batch files) -> Union -> Formula (duplicate flags) -> Output Data
+STEPS
+  1  Read the manifest: which batches should exist this month
+  2  Stop if any batch has not finished validation
+  3  Stack all batches into one table
+  4  Add the duplicate flags
+  5  Write the output
 
 INPUT
   raw/<period>/gstr1/manifest.json                                   {"total_batches": n, "batches": [...]}
@@ -44,14 +48,16 @@ from botocore.exceptions import ClientError
 
 
 # =====================================================================================================
-# STORAGE  (Input Data / Output Data tools)
-# Reads and writes files in S3. With --local-dir the same paths are used inside a local folder.
+# STORAGE - read and write files in S3, or in a local folder when --local-dir is given
 # =====================================================================================================
 class Storage:
     def __init__(self, local_dir: str = None):
         self.bucket    = os.environ.get("S3_BUCKET", "swiggy-idt-poc-bucket")
         self.local_dir = local_dir
-        self.s3        = None if local_dir else boto3.client("s3", region_name=os.environ.get("AWS_DEFAULT_REGION", "ap-south-1"))
+        if local_dir:
+            self.s3 = None
+        else:
+            self.s3 = boto3.client("s3", region_name=os.environ.get("AWS_DEFAULT_REGION", "ap-south-1"))
 
     def exists(self, key: str) -> bool:
         if self.local_dir:
@@ -98,14 +104,14 @@ def run(period: str, local_dir: str = None) -> dict:
     print(f"[Combine batches] period={period}")
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 1 - INPUT: which batches should exist this month?
+    # STEP 1 - Read the manifest: which batches should exist this month?
     # -------------------------------------------------------------------------------------------------
     manifest = json.loads(store.read_bytes(manifest_key))
     batches  = manifest.get("batches") or [f"B{n}" for n in range(1, manifest["total_batches"] + 1)]
     print(f"  Manifest: {len(batches)} batches {batches}")
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 2 - CHECK: every batch must have finished validation; otherwise stop
+    # STEP 2 - Every batch must have finished validation; otherwise stop
     # -------------------------------------------------------------------------------------------------
     batch_keys = {b: f"intermediate/gstr1_final/period={period}/{b}.parquet" for b in batches}
     missing    = [b for b, key in batch_keys.items() if not store.exists(key)]
@@ -113,14 +119,14 @@ def run(period: str, local_dir: str = None) -> dict:
         raise RuntimeError(f"Cannot combine {period}: batches not processed yet: {missing}")
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 3 - UNION: stack all batches (they all have the same columns)
+    # STEP 3 - Stack all batches (they all have the same columns)
     # -------------------------------------------------------------------------------------------------
     tables = [store.read_parquet(key) for key in batch_keys.values()]
     con = duckdb.connect()
     con.register("all_lines", pa.concat_tables(tables))
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 4 - FORMULA: duplicate flags (count how often each Record ID / invoice appears)
+    # STEP 4 - Duplicate flags (count how often each Record ID / invoice appears)
     # -------------------------------------------------------------------------------------------------
     combined = con.execute("""
         SELECT *,
@@ -144,7 +150,7 @@ def run(period: str, local_dir: str = None) -> dict:
     con.close()
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 5 - OUTPUT
+    # STEP 5 - Write the output
     # -------------------------------------------------------------------------------------------------
     store.write_parquet(combined, output_key)
 

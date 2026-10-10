@@ -5,14 +5,20 @@ CLIENT   : Swiggy
 RUNS     : Once per month (PR / GSTR-2B track). Runs in parallel with Activity 8.
 -----------------------------------------------------------------------------------------------------
 WHAT IT DOES
-  Checks every line of Swiggy's purchase register against the GST rules below before the
-  register is reconciled with GSTR-2B (Activity 9). Each line is marked "Success" or "Error"
-  with a remark naming every rule it failed. Error lines go back to the client to correct;
-  only "Success" lines are reconciled.
+  Checks every line of Swiggy's purchase register against the GST rules in RULES (see
+  CONFIGURATION) before the register is reconciled with GSTR-2B (Activity 9). Each line is marked
+  "Success" or "Error" with a remark naming every rule it failed. Error lines go back to the client
+  to correct; only "Success" lines are reconciled.
 
-ALTERYX EQUIVALENT
-  Input Data -> Select (rename + types) -> Data Cleansing -> Formula (one per rule)
-  -> Formula (status + remark) -> Filter (Error rows) -> Output Data (x2)
+STEPS
+  1  Read the purchase register
+  2  Check all mandatory columns are present and rename them
+  3  Clean the values (trim, upper case, blank -> empty) and convert numbers and dates
+  4  Work out the tax we expect on each line
+  5  Check every rule in RULES
+  6  Status, error count and remark
+  7  Final list of output columns
+  8  Write the outputs
 
 INPUT
   raw/<period>/pr/purchase_register.xlsx                         sheet "Purchase Register"
@@ -25,25 +31,14 @@ RECORD ID
   Every line arrives with a Record ID such as  pr-202506-1. It is never changed, so the same
   line can be looked up in the 2B reconciliation and in Athena.
 
-VALIDATION RULES  (a line must pass all of them to be "Success")
-  P01  Record ID present and unique in the file
-  P02  Recipient GSTIN is one of Swiggy's own registrations
-  P03  Supplier GSTIN valid (15 characters, correct pattern, correct check digit)
-  P04  Document type is INV / CRN / DBN and matches the invoice type (CDNR = CRN/DBN)
-  P05  Invoice type is B2B or CDNR
-  P06  Invoice number present, max 16 characters, only letters, digits, "/" and "-"
-  P07  Invoice date valid and not after the end of the return period
-       (earlier dates are allowed - ITC can be claimed for older invoices)
-  P08  Place of supply is a valid state code ("27-Maharashtra")
-  P09  Reverse charge is Y or N
-  P10  HSN/SAC is 4, 6 or 8 digits
-  P11  GST rate is one of the notified rates
-  P12  Taxable value is greater than zero
-  P13  Tax split matches: supplier state <> place of supply = IGST, same state = CGST + SGST (Rs.1)
-  P14  Total invoice value = taxable value + all taxes + cess (Rs.1 tolerance)
-  P15  ITC eligibility is Inputs / Input Services / Capital Goods / Ineligible
-  P16  ITC claimed per tax head is not more than the tax charged; "Ineligible" lines claim no ITC
-  P17  Credit / debit notes carry the original invoice number and date
+QUICK CHANGES
+  Add / change / remove a rule ......... RULES          (one entry per rule, nothing else to edit)
+  Client renamed a column header ....... COLUMN_MAP     (left side = header in the client's file)
+  New Swiggy registration .............. SWIGGY_GSTINS
+  New valid code / rate / state ........ VALID_... lists
+  Rounding tolerance ................... TOLERANCE_RS
+  New output column .................... STEP 7, then add it to athena/tables/pr_validated.sql
+                                         and run  python athena/athena.py setup
 
 HOW TO RUN
   python -m activities.pr_validation.job --period 202506
@@ -60,7 +55,6 @@ from datetime import date
 import boto3
 import duckdb
 import pandas as pd
-import pyarrow as pa
 import pyarrow.parquet as pq
 from duckdb.typing import BOOLEAN, VARCHAR
 
@@ -69,7 +63,7 @@ from duckdb.typing import BOOLEAN, VARCHAR
 # CONFIGURATION
 # =====================================================================================================
 
-# Purchase register headers (as the client sends them) -> column names used inside this job (Select tool)
+# Column header in the client's purchase register  ->  column name used in this job
 COLUMN_MAP = {
     "Record ID":               "record_id",
     "Recipient GSTIN":         "recipient_gstin",
@@ -102,14 +96,87 @@ COLUMN_MAP = {
 }
 
 # Swiggy's own GST registrations that receive purchase invoices
-SWIGGY_GSTINS = ["27AABCS1429B1ZU", "29AABCS1429B1ZQ"]
+SWIGGY_GSTINS = "'27AABCS1429B1ZU', '29AABCS1429B1ZQ'"
 
-VALID_ITC_ELIGIBILITY = ["INPUTS", "INPUT SERVICES", "CAPITAL GOODS", "INELIGIBLE"]
-VALID_GST_RATES       = [0, 0.1, 0.25, 1, 1.5, 3, 5, 6, 7.5, 12, 18, 28]
-VALID_STATE_CODES     = ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13",
-                         "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "26", "27",
-                         "29", "30", "31", "32", "33", "34", "35", "36", "37", "38", "97"]
-TOLERANCE_RS          = 1.0
+VALID_ITC_ELIGIBILITY = "'INPUTS', 'INPUT SERVICES', 'CAPITAL GOODS', 'INELIGIBLE'"
+VALID_GST_RATES       = "0, 0.1, 0.25, 1, 1.5, 3, 5, 6, 7.5, 12, 18, 28"
+VALID_STATE_CODES     = ("'01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11', '12', '13', "
+                         "'14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '24', '26', '27', "
+                         "'29', '30', '31', '32', '33', '34', '35', '36', '37', '38', '97'")
+TOLERANCE_RS          = 1.0     # rounding tolerance (Rs.) for tax, total and ITC checks
+
+# -----------------------------------------------------------------------------------------------------
+# VALIDATION RULES - a line must pass every rule to be "Success".
+#   code   : shown at the start of the error text
+#   error  : error text for the client (do not use single quotes ' in it)
+#   check  : SQL condition that is TRUE when the line is correct.
+#            A missing value makes the check fail automatically.
+#   show   : SQL value added after the error text (None = show nothing)
+# Columns available to the checks: every column of STEP 3 plus pos_state_code, period_end,
+# expected_igst, expected_cgst_sgst (STEP 4).
+# -----------------------------------------------------------------------------------------------------
+RULES = [
+    {"code": "P01", "error": "Record ID missing or duplicated",
+     "check": "record_id IS NOT NULL AND count(*) OVER (PARTITION BY record_id) = 1",
+     "show": "record_id"},
+    {"code": "P02", "error": "Recipient GSTIN is not a Swiggy registration",
+     "check": f"recipient_gstin IN ({SWIGGY_GSTINS})",
+     "show": "recipient_gstin"},
+    {"code": "P03", "error": "Invalid supplier GSTIN",
+     "check": "is_valid_gstin(supplier_gstin)",
+     "show": "supplier_gstin"},
+    {"code": "P04", "error": "Document type does not match invoice type (CDNR needs CRN/DBN, B2B needs INV)",
+     "check": "CASE WHEN invoice_type = 'CDNR' THEN document_type IN ('CRN', 'DBN') "
+              "ELSE document_type = 'INV' END",
+     "show": "document_type"},
+    {"code": "P05", "error": "Invoice type must be B2B or CDNR",
+     "check": "invoice_type IN ('B2B', 'CDNR')",
+     "show": "invoice_type"},
+    {"code": "P06", "error": "Invoice number missing, over 16 characters or has characters other than letters, digits, / and -",
+     "check": "length(invoice_number) <= 16 AND regexp_full_match(invoice_number, '[A-Za-z0-9/-]+')",
+     "show": "invoice_number"},
+    {"code": "P07", "error": "Invoice date missing or after the return period",
+     "check": "invoice_date <= period_end",
+     "show": "invoice_date_text"},
+    {"code": "P08", "error": "Invalid place of supply (format 27-Maharashtra)",
+     "check": f"pos_state_code IN ({VALID_STATE_CODES}) AND place_of_supply LIKE '__-%'",
+     "show": "place_of_supply"},
+    {"code": "P09", "error": "Reverse charge must be Y or N",
+     "check": "reverse_charge IN ('Y', 'N')",
+     "show": "reverse_charge"},
+    {"code": "P10", "error": "HSN/SAC must be 4, 6 or 8 digits",
+     "check": "regexp_full_match(hsn_sac, '[0-9]{4}|[0-9]{6}|[0-9]{8}')",
+     "show": "hsn_sac"},
+    {"code": "P11", "error": "Invalid GST rate",
+     "check": f"gst_rate IN ({VALID_GST_RATES})",
+     "show": "gst_rate"},
+    {"code": "P12", "error": "Taxable value must be more than zero",
+     "check": "taxable_value > 0",
+     "show": "taxable_value"},
+    {"code": "P13", "error": "Tax split wrong for supplier state and place of supply",
+     "check": f"abs(igst_amount - expected_igst) <= {TOLERANCE_RS} "
+              f"AND abs(cgst_amount - expected_cgst_sgst) <= {TOLERANCE_RS} "
+              f"AND abs(sgst_amount - expected_cgst_sgst) <= {TOLERANCE_RS}",
+     "show": "'expected IGST ' || expected_igst || ', CGST and SGST ' || expected_cgst_sgst || ' each'"},
+    {"code": "P14", "error": "Total invoice value is not taxable value + taxes + cess",
+     "check": f"abs(total_invoice_value - (taxable_value + igst_amount + cgst_amount + sgst_amount "
+              f"+ cess_amount)) <= {TOLERANCE_RS}",
+     "show": "total_invoice_value"},
+    {"code": "P15", "error": "ITC eligibility must be Inputs, Input Services, Capital Goods or Ineligible",
+     "check": f"upper(itc_eligibility) IN ({VALID_ITC_ELIGIBILITY})",
+     "show": "itc_eligibility"},
+    {"code": "P16", "error": "ITC claimed is more than the tax charged, or claimed on an ineligible line",
+     "check": f"CASE WHEN upper(itc_eligibility) = 'INELIGIBLE' "
+              f"THEN itc_igst + itc_cgst + itc_sgst + itc_cess = 0 "
+              f"ELSE itc_igst <= igst_amount + {TOLERANCE_RS} AND itc_cgst <= cgst_amount + {TOLERANCE_RS} "
+              f"AND itc_sgst <= sgst_amount + {TOLERANCE_RS} AND itc_cess <= cess_amount + {TOLERANCE_RS} END",
+     "show": "'ITC ' || (itc_igst + itc_cgst + itc_sgst + itc_cess) || ' vs tax ' || "
+             "(igst_amount + cgst_amount + sgst_amount + cess_amount)"},
+    {"code": "P17", "error": "Original invoice number or date missing on credit/debit note",
+     "check": "invoice_type <> 'CDNR' "
+              "OR (original_invoice_number IS NOT NULL AND original_invoice_date IS NOT NULL)",
+     "show": None},
+]
 
 
 # =====================================================================================================
@@ -128,23 +195,26 @@ def is_valid_gstin(gstin) -> bool:
     if not gstin or not GSTIN_PATTERN.match(gstin):
         return False
     total = 0
-    for position, char in enumerate(gstin[:14]):
-        factor  = 1 if position % 2 == 0 else 2          # weights alternate 1, 2, 1, 2 ...
-        product = GSTIN_CHARS.index(char) * factor
-        total  += product // 36 + product % 36
+    for position in range(14):
+        value = GSTIN_CHARS.index(gstin[position])
+        if position % 2 == 1:              # every second character counts double
+            value = value * 2
+        total = total + value // 36 + value % 36
     check_char = GSTIN_CHARS[(36 - total % 36) % 36]
     return gstin[14] == check_char
 
 
 # =====================================================================================================
-# STORAGE  (Input Data / Output Data tools)
-# Reads and writes files in S3. With --local-dir the same paths are used inside a local folder.
+# STORAGE - read and write files in S3, or in a local folder when --local-dir is given
 # =====================================================================================================
 class Storage:
     def __init__(self, local_dir: str = None):
         self.bucket    = os.environ.get("S3_BUCKET", "swiggy-idt-poc-bucket")
         self.local_dir = local_dir
-        self.s3        = None if local_dir else boto3.client("s3", region_name=os.environ.get("AWS_DEFAULT_REGION", "ap-south-1"))
+        if local_dir:
+            self.s3 = None
+        else:
+            self.s3 = boto3.client("s3", region_name=os.environ.get("AWS_DEFAULT_REGION", "ap-south-1"))
 
     def read_bytes(self, key: str) -> bytes:
         if self.local_dir:
@@ -152,31 +222,30 @@ class Storage:
                 return f.read()
         return self.s3.get_object(Bucket=self.bucket, Key=key)["Body"].read()
 
-    def write_bytes(self, key: str, data: bytes) -> str:
+    def write_bytes(self, key: str, data: bytes):
         if self.local_dir:
             path = os.path.join(self.local_dir, key)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "wb") as f:
                 f.write(data)
-            return path
-        self.s3.put_object(Bucket=self.bucket, Key=key, Body=data)
-        return f"s3://{self.bucket}/{key}"
+        else:
+            self.s3.put_object(Bucket=self.bucket, Key=key, Body=data)
 
-    def read_excel_as_text(self, key: str, sheet_name=0) -> pd.DataFrame:
-        """Every cell is read as text (blank cell = ""). Numbers and dates are converted later, on purpose."""
+    def read_excel_as_text(self, key: str, sheet_name) -> pd.DataFrame:
+        """Every cell is read as text (an empty cell becomes ""). Numbers and dates are converted later."""
         return pd.read_excel(io.BytesIO(self.read_bytes(key)), sheet_name=sheet_name, dtype=str, na_filter=False)
 
-    def write_parquet(self, table: pa.Table, key: str) -> str:
+    def write_parquet(self, table, key: str):
         buffer = io.BytesIO()
         pq.write_table(table, buffer)
-        return self.write_bytes(key, buffer.getvalue())
+        self.write_bytes(key, buffer.getvalue())
 
-    def write_excel(self, sheets: dict, key: str) -> str:
+    def write_excel(self, sheets: dict, key: str):
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             for sheet_name, df in sheets.items():
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
-        return self.write_bytes(key, buffer.getvalue())
+        self.write_bytes(key, buffer.getvalue())
 
 
 # =====================================================================================================
@@ -188,19 +257,21 @@ def run(period: str, local_dir: str = None) -> dict:
     output_key = f"intermediate/pr_validated/period={period}/pr_validated.parquet"
     error_key  = f"final/{period}/pr_errors_for_client.xlsx"
 
-    year, month = int(period[:4]), int(period[4:])
-    period_end  = date(year, month, calendar.monthrange(year, month)[1])
+    # Last day of the return period, e.g. 202506 -> 2025-06-30
+    year       = int(period[:4])
+    month      = int(period[4:])
+    period_end = date(year, month, calendar.monthrange(year, month)[1])
 
     print(f"[PR validation] period={period}")
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 1 - INPUT: purchase register (all cells as text)
+    # STEP 1 - Read the purchase register (every cell as text)
     # -------------------------------------------------------------------------------------------------
     register = store.read_excel_as_text(input_key, sheet_name="Purchase Register")
     print(f"  Lines read: {len(register)}")
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 2 - SELECT: check every mandatory column is present, then rename
+    # STEP 2 - Check all mandatory columns are present, then rename them
     # -------------------------------------------------------------------------------------------------
     missing = [header for header in COLUMN_MAP if header not in register.columns]
     if missing:
@@ -212,12 +283,15 @@ def run(period: str, local_dir: str = None) -> dict:
     con.register("register", register)
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 3 - DATA CLEANSING + TYPES (blank -> NULL, codes upper case, TRY_CAST numbers and dates)
+    # STEP 3 - Clean the values and convert numbers and dates
+    #   NULLIF(trim(x), '')  : remove spaces; an empty cell becomes NULL (= missing)
+    #   TRY_CAST(... DOUBLE) : text -> number; text that is not a number becomes NULL
+    #   try_strptime         : text -> date (dd/mm/yyyy or yyyy-mm-dd); anything else becomes NULL
     # -------------------------------------------------------------------------------------------------
-    con.execute("""
+    con.execute(f"""
         CREATE TABLE cleaned AS
         SELECT
-            CAST(row_number() OVER () + 1 AS INTEGER)                        AS source_row_number,  -- Excel row
+            CAST(row_number() OVER () + 1 AS INTEGER)                        AS source_row_number,  -- Excel row, row 1 = headers
             NULLIF(trim(record_id), '')                                      AS record_id,
             upper(NULLIF(trim(recipient_gstin), ''))                         AS recipient_gstin,
             upper(NULLIF(trim(supplier_gstin), ''))                          AS supplier_gstin,
@@ -248,105 +322,64 @@ def run(period: str, local_dir: str = None) -> dict:
             NULLIF(trim(voucher_number), '')                                 AS voucher_number,
             CAST(try_strptime(trim(voucher_date), '%d/%m/%Y') AS DATE)       AS voucher_date,
             NULLIF(trim(original_invoice_number), '')                        AS original_invoice_number,
-            NULLIF(trim(original_invoice_date), '')                          AS original_invoice_date
+            NULLIF(trim(original_invoice_date), '')                          AS original_invoice_date,
+            DATE '{period_end}'                                              AS period_end
         FROM register
     """)
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 4 - FORMULA: expected tax split (supplier state vs place of supply)
+    # STEP 4 - The tax we expect on each line
+    #   supplier state <> place of supply state  -> all tax is IGST
+    #   same state                               -> half CGST + half SGST
     # -------------------------------------------------------------------------------------------------
     con.execute("""
         CREATE TABLE with_expected_tax AS
         SELECT *,
             CASE WHEN pos_state_code <> left(supplier_gstin, 2)
-                 THEN round(taxable_value * gst_rate / 100, 2) ELSE 0 END           AS expected_igst,
+                 THEN round(taxable_value * gst_rate / 100, 2) ELSE 0 END    AS expected_igst,
             CASE WHEN pos_state_code <> left(supplier_gstin, 2)
-                 THEN 0 ELSE round(taxable_value * gst_rate / 200, 2) END           AS expected_cgst_sgst
+                 THEN 0 ELSE round(taxable_value * gst_rate / 200, 2) END    AS expected_cgst_sgst
         FROM cleaned
     """)
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 5 - FORMULA: one TRUE/FALSE column per rule (TRUE = rule passed; missing value = failed)
+    # STEP 5 - Check every rule: one TRUE/FALSE column per rule, e.g. p03_ok (TRUE = passed)
     # -------------------------------------------------------------------------------------------------
-    swiggy      = ", ".join(f"'{g}'" for g in SWIGGY_GSTINS)
-    state_codes = ", ".join(f"'{c}'" for c in VALID_STATE_CODES)
-    gst_rates   = ", ".join(str(r) for r in VALID_GST_RATES)
-    itc_values  = ", ".join(f"'{v}'" for v in VALID_ITC_ELIGIBILITY)
-    tol         = TOLERANCE_RS
+    rule_columns = []
+    for rule in RULES:
+        rule_columns.append(f"COALESCE({rule['check']}, false) AS {rule['code'].lower()}_ok")
 
     con.execute(f"""
         CREATE TABLE checked AS
-        SELECT *,
-            COALESCE(record_id IS NOT NULL AND count(*) OVER (PARTITION BY record_id) = 1, false) AS p01_ok,
-            COALESCE(recipient_gstin IN ({swiggy}), false)                                      AS p02_ok,
-            COALESCE(is_valid_gstin(supplier_gstin), false)                                     AS p03_ok,
-            COALESCE(document_type IN ('INV', 'CRN', 'DBN') AND
-                     CASE WHEN invoice_type = 'CDNR' THEN document_type IN ('CRN', 'DBN')
-                          ELSE document_type = 'INV' END, false)                                 AS p04_ok,
-            COALESCE(invoice_type IN ('B2B', 'CDNR'), false)                                    AS p05_ok,
-            COALESCE(length(invoice_number) <= 16
-                     AND regexp_full_match(invoice_number, '[A-Za-z0-9/-]+'), false)             AS p06_ok,
-            COALESCE(invoice_date <= DATE '{period_end}', false)                                AS p07_ok,
-            COALESCE(pos_state_code IN ({state_codes})
-                     AND regexp_full_match(place_of_supply, '[0-9]{{2}}-.+'), false)             AS p08_ok,
-            COALESCE(reverse_charge IN ('Y', 'N'), false)                                       AS p09_ok,
-            COALESCE(regexp_full_match(hsn_sac, '[0-9]{{4}}|[0-9]{{6}}|[0-9]{{8}}'), false)      AS p10_ok,
-            COALESCE(gst_rate IN ({gst_rates}), false)                                          AS p11_ok,
-            COALESCE(taxable_value > 0, false)                                                  AS p12_ok,
-            COALESCE(abs(igst_amount - expected_igst)      <= {tol}
-                 AND abs(cgst_amount - expected_cgst_sgst) <= {tol}
-                 AND abs(sgst_amount - expected_cgst_sgst) <= {tol}, false)                      AS p13_ok,
-            COALESCE(abs(total_invoice_value - (taxable_value + igst_amount + cgst_amount
-                                                + sgst_amount + cess_amount)) <= {tol}, false)   AS p14_ok,
-            COALESCE(upper(itc_eligibility) IN ({itc_values}), false)                           AS p15_ok,
-            COALESCE(CASE WHEN upper(itc_eligibility) = 'INELIGIBLE'
-                          THEN itc_igst + itc_cgst + itc_sgst + itc_cess = 0
-                          ELSE itc_igst <= igst_amount + {tol} AND itc_cgst <= cgst_amount + {tol}
-                           AND itc_sgst <= sgst_amount + {tol} AND itc_cess <= cess_amount + {tol}
-                     END, false)                                                                 AS p16_ok,
-            COALESCE(invoice_type <> 'CDNR'
-                     OR (original_invoice_number IS NOT NULL AND original_invoice_date IS NOT NULL), false) AS p17_ok
+        SELECT *, {", ".join(rule_columns)}
         FROM with_expected_tax
     """)
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 6 - FORMULA: status, error count and a remark naming every failed rule
+    # STEP 6 - Error count and remark (the remark lists every failed rule, separated by " | ")
     # -------------------------------------------------------------------------------------------------
-    con.execute("""
+    error_counts = []
+    error_texts  = []
+    for rule in RULES:
+        ok_column = f"{rule['code'].lower()}_ok"
+        text      = f"{rule['code']} {rule['error']}"
+        error_counts.append(f"CAST(NOT {ok_column} AS INTEGER)")
+        if rule["show"]:
+            error_texts.append(f"CASE WHEN NOT {ok_column} THEN '{text}: ' || "
+                               f"coalesce(CAST({rule['show']} AS VARCHAR), '(blank)') END")
+        else:
+            error_texts.append(f"CASE WHEN NOT {ok_column} THEN '{text}' END")
+
+    con.execute(f"""
         CREATE TABLE validated AS
         SELECT *,
-            CAST(NOT p01_ok AS INTEGER) + CAST(NOT p02_ok AS INTEGER) + CAST(NOT p03_ok AS INTEGER)
-          + CAST(NOT p04_ok AS INTEGER) + CAST(NOT p05_ok AS INTEGER) + CAST(NOT p06_ok AS INTEGER)
-          + CAST(NOT p07_ok AS INTEGER) + CAST(NOT p08_ok AS INTEGER) + CAST(NOT p09_ok AS INTEGER)
-          + CAST(NOT p10_ok AS INTEGER) + CAST(NOT p11_ok AS INTEGER) + CAST(NOT p12_ok AS INTEGER)
-          + CAST(NOT p13_ok AS INTEGER) + CAST(NOT p14_ok AS INTEGER) + CAST(NOT p15_ok AS INTEGER)
-          + CAST(NOT p16_ok AS INTEGER) + CAST(NOT p17_ok AS INTEGER)                    AS error_count,
-            concat_ws(' | ',
-                CASE WHEN NOT p01_ok THEN 'P01 Record ID missing or duplicated' END,
-                CASE WHEN NOT p02_ok THEN 'P02 Recipient GSTIN is not a Swiggy registration: ' || coalesce(recipient_gstin, '(blank)') END,
-                CASE WHEN NOT p03_ok THEN 'P03 Invalid supplier GSTIN: ' || coalesce(supplier_gstin, '(blank)') END,
-                CASE WHEN NOT p04_ok THEN 'P04 Document type ' || coalesce(document_type, '(blank)') || ' does not match invoice type' END,
-                CASE WHEN NOT p05_ok THEN 'P05 Invalid invoice type: ' || coalesce(invoice_type, '(blank)') END,
-                CASE WHEN NOT p06_ok THEN 'P06 Invalid invoice number: ' || coalesce(invoice_number, '(blank)') END,
-                CASE WHEN NOT p07_ok THEN 'P07 Invoice date missing or after return period: ' || coalesce(invoice_date_text, '(blank)') END,
-                CASE WHEN NOT p08_ok THEN 'P08 Invalid place of supply: ' || coalesce(place_of_supply, '(blank)') END,
-                CASE WHEN NOT p09_ok THEN 'P09 Reverse charge must be Y or N' END,
-                CASE WHEN NOT p10_ok THEN 'P10 HSN/SAC must be 4, 6 or 8 digits: ' || coalesce(hsn_sac, '(blank)') END,
-                CASE WHEN NOT p11_ok THEN 'P11 Invalid GST rate: ' || coalesce(CAST(gst_rate AS VARCHAR), '(blank)') END,
-                CASE WHEN NOT p12_ok THEN 'P12 Taxable value must be positive: ' || coalesce(CAST(taxable_value AS VARCHAR), '(blank)') END,
-                CASE WHEN NOT p13_ok THEN 'P13 Tax split wrong for supplier state / place of supply (expected IGST '
-                                          || CAST(expected_igst AS VARCHAR) || ', CGST/SGST '
-                                          || CAST(expected_cgst_sgst AS VARCHAR) || ')' END,
-                CASE WHEN NOT p14_ok THEN 'P14 Total invoice value does not equal taxable value + taxes' END,
-                CASE WHEN NOT p15_ok THEN 'P15 Invalid ITC eligibility: ' || coalesce(itc_eligibility, '(blank)') END,
-                CASE WHEN NOT p16_ok THEN 'P16 ITC claimed is more than tax charged (or claimed on an ineligible line)' END,
-                CASE WHEN NOT p17_ok THEN 'P17 Original invoice number/date missing on credit/debit note' END
-            ) AS failed_rules
+            {" + ".join(error_counts)}                 AS error_count,
+            concat_ws(' | ', {", ".join(error_texts)}) AS failed_rules
         FROM checked
     """)
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 7 - SELECT: final output columns, fixed order and types (Athena table pr_validated)
+    # STEP 7 - Final list of output columns (order and types are fixed - Athena reads them)
     # -------------------------------------------------------------------------------------------------
     result = con.execute("""
         SELECT
@@ -369,23 +402,22 @@ def run(period: str, local_dir: str = None) -> dict:
     con.close()
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 8 - OUTPUT
+    # STEP 8 - Write every line to parquet (Activity 9 + Athena) and the error lines to Excel (client)
     # -------------------------------------------------------------------------------------------------
     store.write_parquet(result, output_key)
-    result_df = result.to_pandas()
-    errors_df = result_df[result_df["validation_status"] == "Error"].copy()
-    for column in ["invoice_date", "voucher_date"]:
-        errors_df[column] = pd.to_datetime(errors_df[column]).dt.strftime("%d/%m/%Y")
-    errors_df["processed_at"] = errors_df["processed_at"].dt.strftime("%d/%m/%Y %H:%M")
-    store.write_excel({"Errors": errors_df}, error_key)
 
-    summary = {"lines": len(result_df),
-               "success": int((result_df["validation_status"] == "Success").sum()),
-               "errors": len(errors_df)}
-    print(f"  Result: {summary['success']} success, {summary['errors']} errors")
+    all_lines = result.to_pandas()
+    errors    = all_lines[all_lines["validation_status"] == "Error"].copy()
+    errors["invoice_date"] = pd.to_datetime(errors["invoice_date"]).dt.strftime("%d/%m/%Y")
+    errors["voucher_date"] = pd.to_datetime(errors["voucher_date"]).dt.strftime("%d/%m/%Y")
+    errors["processed_at"] = errors["processed_at"].dt.strftime("%d/%m/%Y %H:%M")
+    store.write_excel({"Errors": errors}, error_key)
+
+    success_count = int((all_lines["validation_status"] == "Success").sum())
+    print(f"  Result: {success_count} success, {len(errors)} errors")
     print(f"  Output: {output_key}")
     print(f"          {error_key}")
-    return summary
+    return {"lines": len(all_lines), "success": success_count, "errors": len(errors)}
 
 
 if __name__ == "__main__":

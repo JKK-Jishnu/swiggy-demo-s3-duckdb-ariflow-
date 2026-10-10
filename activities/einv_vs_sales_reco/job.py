@@ -22,10 +22,20 @@ WHAT IT DOES
   so "SWG/2506/00012" and "swg-2506-00012" count as the same number.
   Each row is matched at most once; if several rows qualify, the closest amount wins.
 
-ALTERYX EQUIVALENT
-  Input Data (EINV) + Input Data (sales) -> Filter -> Formula (normalise invoice no)
-  -> Join (level 1) -> unjoined L/R into Join (level 2) -> unjoined into Join (level 3)
-  -> Union (J + L + R) -> Summarize -> Output Data
+STEPS
+  1  Read the EINV file, rename the columns, clean values and convert numbers and dates
+  2  Build the two sides in the same shape: LEFT = EINV, RIGHT = sales
+  3  Matching ladder: level 1, then level 2 and 3 on what is still unmatched
+  4  Stack matched pairs, EINV-only lines and sales-only lines into one table
+  5  Differences and a remark per row
+  6  Summary per match level
+  7  Write the outputs
+
+QUICK CHANGES
+  Change a match level / add a level ... STEP 3 (one match_level(...) call per level)
+  Amount tolerance ..................... AMOUNT_TOLERANCE_RS
+  Which sales lines are compared ....... SALES_NEEDING_EINV
+  Column renamed in the EINV file ..... EINV_COLUMN_MAP
 
 INPUT
   raw/<period>/einv_bolton/einv_bolton.xlsx                                   sheet "EINV"
@@ -62,7 +72,7 @@ import pyarrow.parquet as pq
 # =====================================================================================================
 AMOUNT_TOLERANCE_RS = 1.0
 
-# EINV file headers -> column names used inside this job (Select tool)
+# Column header in the EINV file  ->  column name used in this job
 EINV_COLUMN_MAP = {
     "Record ID":              "record_id",
     "IRN":                    "irn",
@@ -92,14 +102,16 @@ SALES_NEEDING_IRN = "validation_status = 'Success' AND invoice_type IN ('B2B', '
 
 
 # =====================================================================================================
-# STORAGE  (Input Data / Output Data tools)
-# Reads and writes files in S3. With --local-dir the same paths are used inside a local folder.
+# STORAGE - read and write files in S3, or in a local folder when --local-dir is given
 # =====================================================================================================
 class Storage:
     def __init__(self, local_dir: str = None):
         self.bucket    = os.environ.get("S3_BUCKET", "swiggy-idt-poc-bucket")
         self.local_dir = local_dir
-        self.s3        = None if local_dir else boto3.client("s3", region_name=os.environ.get("AWS_DEFAULT_REGION", "ap-south-1"))
+        if local_dir:
+            self.s3 = None
+        else:
+            self.s3 = boto3.client("s3", region_name=os.environ.get("AWS_DEFAULT_REGION", "ap-south-1"))
 
     def read_bytes(self, key: str) -> bytes:
         if self.local_dir:
@@ -178,7 +190,7 @@ def run(period: str, local_dir: str = None) -> dict:
     print(f"[EINV vs Sales reco] period={period}")
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 1 - INPUT + SELECT + CLEANSING: EINV file (text) -> typed EINV records
+    # STEP 1 - Read the EINV file, rename the columns, clean values and convert numbers and dates
     # -------------------------------------------------------------------------------------------------
     einv_raw = store.read_excel_as_text(einv_key, sheet_name="EINV")
     missing  = [h for h in EINV_COLUMN_MAP if h not in einv_raw.columns]
@@ -217,7 +229,7 @@ def run(period: str, local_dir: str = None) -> dict:
     con.register("sales", store.read_parquet(sales_key))
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 2 - FILTER + FORMULA: the two sides of the reconciliation, in the same shape
+    # STEP 2 - The two sides of the reconciliation, in the same shape
     #   invoice_key = invoice number without "/", "-", spaces, in upper case
     # -------------------------------------------------------------------------------------------------
     con.execute("""
@@ -242,7 +254,7 @@ def run(period: str, local_dir: str = None) -> dict:
     print(f"  EINV active IRNs: {left_count} (cancelled ignored: {cancelled}) | sales lines needing IRN: {right_count}")
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 3 - JOIN LADDER: level 1, 2, 3 (each on what is still unmatched)
+    # STEP 3 - Matching ladder: level 1, 2, 3 (each level only sees what is still unmatched)
     # -------------------------------------------------------------------------------------------------
     con.execute("CREATE TABLE matches (left_record_id VARCHAR, right_record_id VARCHAR, level_no INTEGER, match_level VARCHAR)")
     match_level(con, 1, "L1 Exact",
@@ -253,7 +265,8 @@ def run(period: str, local_dir: str = None) -> dict:
                 f"l.gstin = r.gstin AND abs(l.amount - r.amount) <= {AMOUNT_TOLERANCE_RS}")
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 4 - UNION: matched pairs (J) + EINV only (L) + Sales only (R), with a remark per row
+    # STEP 4 - Stack matched pairs + EINV-only lines + sales-only lines into one table.
+    #   UNION ALL BY NAME matches columns by name; columns a part does not have become NULL.
     # -------------------------------------------------------------------------------------------------
     con.execute("""
         CREATE TABLE reco_union AS
@@ -267,17 +280,24 @@ def run(period: str, local_dir: str = None) -> dict:
         JOIN left_side  l ON l.record_id = m.left_record_id
         JOIN right_side r ON r.record_id = m.right_record_id
 
-        UNION ALL
-        SELECT 'Only in EINV', 4, l.record_id, NULL, NULL, l.irn, l.gstin, NULL,
-               l.invoice_number, NULL, l.invoice_date, NULL, l.amount, NULL
+        UNION ALL BY NAME
+        SELECT 'Only in EINV' AS match_level, 4 AS level_no,
+               l.record_id AS einv_record_id, l.irn, l.gstin AS einv_buyer_gstin,
+               l.invoice_number AS einv_document_number, l.invoice_date AS einv_document_date,
+               l.amount AS einv_taxable_value
         FROM left_side l WHERE l.record_id NOT IN (SELECT left_record_id FROM matches)
 
-        UNION ALL
-        SELECT 'Only in Sales', 5, NULL, r.record_id, r.batch_id, NULL, NULL, r.gstin,
-               NULL, r.invoice_number, NULL, r.invoice_date, NULL, r.amount
+        UNION ALL BY NAME
+        SELECT 'Only in Sales' AS match_level, 5 AS level_no,
+               r.record_id AS sales_record_id, r.batch_id AS sales_batch_id, r.gstin AS sales_receiver_gstin,
+               r.invoice_number AS sales_invoice_number, r.invoice_date AS sales_invoice_date,
+               r.amount AS sales_taxable_value
         FROM right_side r WHERE r.record_id NOT IN (SELECT right_record_id FROM matches)
     """)
 
+    # -------------------------------------------------------------------------------------------------
+    # STEP 5 - Differences and a remark per row (final column list and types - Athena reads them)
+    # -------------------------------------------------------------------------------------------------
     reco = con.execute("""
         SELECT match_level, CAST(level_no AS INTEGER) AS level_no,
                einv_record_id, sales_record_id, sales_batch_id, irn,
@@ -300,7 +320,7 @@ def run(period: str, local_dir: str = None) -> dict:
     con.register("reco_result", reco)
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 5 - SUMMARIZE: counts and amounts per match level, with every Record ID behind each count
+    # STEP 6 - Summary per match level: counts, amounts and every Record ID behind each count
     # -------------------------------------------------------------------------------------------------
     summary = con.execute("""
         SELECT match_level                                              AS "Match Level",
@@ -317,7 +337,7 @@ def run(period: str, local_dir: str = None) -> dict:
     con.close()
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 6 - OUTPUT
+    # STEP 7 - Write the outputs
     # -------------------------------------------------------------------------------------------------
     store.write_parquet(einv_records, records_key)
     store.write_parquet(reco, reco_key)

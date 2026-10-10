@@ -13,9 +13,15 @@ WHAT IT DOES
 
   If the client has not sent a corrections file, the register is passed on unchanged.
 
-ALTERYX EQUIVALENT
-  Input Data (register) + Input Data (corrections) -> Join on Record ID
-  -> Formula (take corrected value when not blank) -> Output Data (corrected register + change log)
+STEPS
+  1  Read the original register and the first validation result
+  2  Read the client corrections (if any)
+  3  Apply each correction to the register line with the same Record ID, and log every change
+  4  Add the first validation result to each line
+  5  Write the corrected register and the change log
+
+QUICK CHANGES
+  Allow / stop correcting a field ...... CORRECTABLE_COLUMNS
 
 INPUT
   raw/<period>/gstr1/<batch>/gstr1_<batch>.xlsx                      original sales register
@@ -64,14 +70,16 @@ CORRECTABLE_COLUMNS = [
 
 
 # =====================================================================================================
-# STORAGE  (Input Data / Output Data tools)
-# Reads and writes files in S3. With --local-dir the same paths are used inside a local folder.
+# STORAGE - read and write files in S3, or in a local folder when --local-dir is given
 # =====================================================================================================
 class Storage:
     def __init__(self, local_dir: str = None):
         self.bucket    = os.environ.get("S3_BUCKET", "swiggy-idt-poc-bucket")
         self.local_dir = local_dir
-        self.s3        = None if local_dir else boto3.client("s3", region_name=os.environ.get("AWS_DEFAULT_REGION", "ap-south-1"))
+        if local_dir:
+            self.s3 = None
+        else:
+            self.s3 = boto3.client("s3", region_name=os.environ.get("AWS_DEFAULT_REGION", "ap-south-1"))
 
     def exists(self, key: str) -> bool:
         if self.local_dir:
@@ -132,14 +140,14 @@ def run(period: str, batch_id: str, local_dir: str = None) -> dict:
     print(f"[GSTR1 error fixing] period={period} batch={batch_id}")
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 1 - INPUT: original register (text, exactly as uploaded) and the first validation result
+    # STEP 1 - Read the original register (text, exactly as uploaded) and the first validation result
     # -------------------------------------------------------------------------------------------------
     register  = store.read_excel_as_text(register_key, sheet_name="Sales Register")
     validated = store.read_parquet(validated_key)[["record_id", "validation_status", "validation_remark"]]
     print(f"  Register lines: {len(register)}")
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 2 - INPUT: client corrections (optional)
+    # STEP 2 - Read the client corrections (optional)
     # -------------------------------------------------------------------------------------------------
     if store.exists(corrections_key):
         corrections = store.read_excel_as_text(corrections_key, sheet_name="Corrections")
@@ -149,7 +157,7 @@ def run(period: str, batch_id: str, local_dir: str = None) -> dict:
         print("  No corrections file received - register passed on unchanged")
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 3 - APPLY: for each correction row, copy every non-blank cell onto the register line
+    # STEP 3 - For each correction row, copy every non-blank cell onto the register line
     #          with the same Record ID, and log what changed.
     # -------------------------------------------------------------------------------------------------
     register = register.set_index(RECORD_ID, drop=False)
@@ -183,7 +191,7 @@ def run(period: str, batch_id: str, local_dir: str = None) -> dict:
             register.at[record_id, "Correction Remark"]  = str(correction.get("Correction Remark", "")).strip()
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 4 - JOIN: carry the first validation result along, so the final data shows
+    # STEP 4 - Add the first validation result to each line, so the final data shows
     #          "Error before correction -> Success after correction"
     # -------------------------------------------------------------------------------------------------
     first_pass = validated.set_index("record_id")
@@ -192,7 +200,7 @@ def run(period: str, batch_id: str, local_dir: str = None) -> dict:
     register = register.reset_index(drop=True)
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 5 - OUTPUT: corrected register (for re-validation) and the change log (for audit)
+    # STEP 5 - Write the corrected register (for re-validation) and the change log (for audit)
     # -------------------------------------------------------------------------------------------------
     store.write_parquet(register.astype(str), output_key)
     log_df = pd.DataFrame(change_log, columns=["Record ID", "Field", "Old Value", "New Value", "Status"])

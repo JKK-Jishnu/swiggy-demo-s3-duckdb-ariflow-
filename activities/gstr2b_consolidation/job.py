@@ -17,9 +17,16 @@ WHAT IT DOES
     document_type    INV for invoices, CRN / DBN for credit / debit notes
     source_file      the workbook the line came from
 
-ALTERYX EQUIVALENT
-  Directory -> Dynamic Input (every workbook, every sheet) -> Select (per sheet layout)
-  -> Union -> Data Cleansing -> Output Data
+STEPS
+  1  Find every 2B workbook of the month
+  2  Read each sheet and rename its headers to the common layout (SHEET_LAYOUTS)
+  3  Stack all sheets, clean values and convert numbers and dates
+  4  Write the output
+
+QUICK CHANGES
+  GSTN changed a 2B column header ...... SHEET_LAYOUTS
+  New column ........................... SHEET_LAYOUTS + ALL_COLUMNS + STEP 3, then
+                                         athena/tables/gstr2b_consolidated.sql
 
 INPUT
   raw/<period>/2b_bolton/2b_<GSTIN>.xlsx                         sheets "B2B" and "CDNR"
@@ -92,22 +99,28 @@ SHEET_LAYOUTS = {
 }
 
 # every column of the stacked table (a sheet that lacks one gets it blank)
-ALL_COLUMNS = ["record_id", "supplier_gstin", "supplier_name", "document_number", "note_type",
-               "supply_type", "document_date", "document_value"] + \
-              [c for c in COMMON_COLUMNS.values() if c not in ("record_id", "supplier_gstin", "supplier_name")]
+ALL_COLUMNS = [
+    "record_id", "supplier_gstin", "supplier_name", "document_number", "note_type", "supply_type",
+    "document_date", "document_value", "place_of_supply", "reverse_charge", "gst_rate", "taxable_value",
+    "igst_amount", "cgst_amount", "sgst_amount", "cess_amount", "supplier_filing_period",
+    "supplier_filing_date", "itc_availability", "itc_unavailability_reason", "applicable_tax_rate_pct",
+    "source", "irn", "irn_date",
+]
 
 GSTIN_IN_FILE_NAME = re.compile(r"2b_([0-9A-Z]{15})\.xlsx$", re.IGNORECASE)
 
 
 # =====================================================================================================
-# STORAGE  (Input Data / Output Data tools)
-# Reads and writes files in S3. With --local-dir the same paths are used inside a local folder.
+# STORAGE - read and write files in S3, or in a local folder when --local-dir is given
 # =====================================================================================================
 class Storage:
     def __init__(self, local_dir: str = None):
         self.bucket    = os.environ.get("S3_BUCKET", "swiggy-idt-poc-bucket")
         self.local_dir = local_dir
-        self.s3        = None if local_dir else boto3.client("s3", region_name=os.environ.get("AWS_DEFAULT_REGION", "ap-south-1"))
+        if local_dir:
+            self.s3 = None
+        else:
+            self.s3 = boto3.client("s3", region_name=os.environ.get("AWS_DEFAULT_REGION", "ap-south-1"))
 
     def list_files(self, prefix: str, suffix: str) -> list:
         """All file paths under a folder that end with suffix, e.g. every .xlsx in raw/202506/2b_bolton/"""
@@ -155,14 +168,14 @@ def run(period: str, local_dir: str = None) -> dict:
     print(f"[GSTR-2B consolidation] period={period}")
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 1 - DIRECTORY: find every 2B workbook of the month
+    # STEP 1 - Find every 2B workbook of the month
     # -------------------------------------------------------------------------------------------------
     files = store.list_files(input_folder, ".xlsx")
     if not files:
         raise FileNotFoundError(f"No GSTR-2B workbooks found in {input_folder}")
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 2 - DYNAMIC INPUT + SELECT: read each sheet, rename its headers to the common layout
+    # STEP 2 - Read each sheet and rename its headers to the common layout
     # -------------------------------------------------------------------------------------------------
     pieces = []
     for file_key in files:
@@ -190,7 +203,7 @@ def run(period: str, local_dir: str = None) -> dict:
             print(f"  {file_name} / {sheet_name}: {len(piece)} lines")
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 3 - UNION + DATA CLEANSING + TYPES
+    # STEP 3 - Stack all sheets, clean values and convert numbers and dates
     # -------------------------------------------------------------------------------------------------
     con = duckdb.connect()
     con.register("stacked", pd.concat(pieces, ignore_index=True))
@@ -240,7 +253,7 @@ def run(period: str, local_dir: str = None) -> dict:
     con.close()
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 4 - OUTPUT
+    # STEP 4 - Write the output
     # -------------------------------------------------------------------------------------------------
     store.write_parquet(result, output_key)
 

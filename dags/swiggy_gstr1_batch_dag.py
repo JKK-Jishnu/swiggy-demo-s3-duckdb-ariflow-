@@ -44,16 +44,19 @@ def _s3():
     return boto3.client("s3", region_name=REGION)
 
 
-def _manifest(period: str) -> dict:
+def _expected_batches(period: str) -> list:
+    """Batches of the month from raw/<period>/gstr1/manifest.json, e.g. ["B1", "B2", "B3"]"""
     body = _s3().get_object(Bucket=BUCKET, Key=f"raw/{period}/gstr1/manifest.json")["Body"].read()
-    return json.loads(body)
+    manifest = json.loads(body)
+    if "batches" in manifest:
+        return manifest["batches"]
+    return ["B" + str(number) for number in range(1, manifest["total_batches"] + 1)]
 
 
 # ----------------------------------------------------------------------------------------- tasks
 def read_manifest(**context):
     period, batch = _period_and_batch(context)
-    manifest = _manifest(period)
-    batches  = manifest.get("batches") or [f"B{n}" for n in range(1, manifest["total_batches"] + 1)]
+    batches = _expected_batches(period)
     if batch not in batches:
         raise ValueError(f"Batch {batch} is not in the {period} manifest {batches}")
     print(f"Manifest {period}: {len(batches)} batches {batches}")
@@ -92,14 +95,21 @@ def mark_batch_complete(**context):
 
 def check_all_batches_done(**context):
     period, _ = _period_and_batch(context)
-    manifest = _manifest(period)
-    expected = manifest.get("batches") or [f"B{n}" for n in range(1, manifest["total_batches"] + 1)]
-    listing  = _s3().list_objects_v2(Bucket=BUCKET, Prefix=f"batch_status/{period}/")
-    done     = {obj["Key"].rsplit("/", 1)[-1][:-len(".done")]
-                for obj in listing.get("Contents", []) if obj["Key"].endswith(".done")}
-    pending  = [b for b in expected if b not in done]
+    expected = _expected_batches(period)
+
+    # batch_status/202506/B1.done  ->  "B1"
+    listing = _s3().list_objects_v2(Bucket=BUCKET, Prefix=f"batch_status/{period}/")
+    done = []
+    for obj in listing.get("Contents", []):
+        file_name = obj["Key"].split("/")[-1]
+        if file_name.endswith(".done"):
+            done.append(file_name.replace(".done", ""))
+
+    pending = [batch for batch in expected if batch not in done]
     print(f"Batches done: {sorted(done)} | still pending: {pending}")
-    return "wait_for_more_batches" if pending else "trigger_combine_dag"
+    if pending:
+        return "wait_for_more_batches"
+    return "trigger_combine_dag"
 
 
 # ----------------------------------------------------------------------------------------- DAG

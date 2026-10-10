@@ -27,10 +27,19 @@ WHAT IT DOES
     L2 / L3          : ITC claimed above the tax shown in 2B (if any)
     L1 / Only in 2B  : 0
 
-ALTERYX EQUIVALENT
-  Input Data (2B) + Input Data (PR) -> Filter -> Formula (normalise invoice no)
-  -> Join (level 1) -> unjoined L/R into Join (level 2) -> unjoined into Join (level 3)
-  -> Union (J + L + R) -> Formula (ITC at risk) -> Summarize -> Output Data
+STEPS
+  1  Read the consolidated 2B and the validated purchase register
+  2  Build the two sides in the same shape: LEFT = 2B, RIGHT = purchase register
+  3  Matching ladder: level 1, then level 2 and 3 on what is still unmatched
+  4  Stack matched pairs, 2B-only lines and PR-only lines into one table
+  5  Differences, ITC at risk and a remark per row
+  6  Summary per match level
+  7  Write the outputs
+
+QUICK CHANGES
+  Change a match level / add a level ... STEP 3 (one match_level(...) call per level)
+  Amount tolerance ..................... AMOUNT_TOLERANCE_RS
+  ITC at risk rule ..................... STEP 5 (itc_at_risk)
 
 INPUT
   intermediate/gstr2b_consolidated/period=<period>/gstr2b_consolidated.parquet   (Activity 8)
@@ -67,14 +76,16 @@ AMOUNT_TOLERANCE_RS = 1.0
 
 
 # =====================================================================================================
-# STORAGE  (Input Data / Output Data tools)
-# Reads and writes files in S3. With --local-dir the same paths are used inside a local folder.
+# STORAGE - read and write files in S3, or in a local folder when --local-dir is given
 # =====================================================================================================
 class Storage:
     def __init__(self, local_dir: str = None):
         self.bucket    = os.environ.get("S3_BUCKET", "swiggy-idt-poc-bucket")
         self.local_dir = local_dir
-        self.s3        = None if local_dir else boto3.client("s3", region_name=os.environ.get("AWS_DEFAULT_REGION", "ap-south-1"))
+        if local_dir:
+            self.s3 = None
+        else:
+            self.s3 = boto3.client("s3", region_name=os.environ.get("AWS_DEFAULT_REGION", "ap-south-1"))
 
     def read_bytes(self, key: str) -> bytes:
         if self.local_dir:
@@ -148,14 +159,14 @@ def run(period: str, local_dir: str = None) -> dict:
     print(f"[GSTR-2B vs PR reco] period={period}")
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 1 - INPUT
+    # STEP 1 - Read the consolidated 2B and the validated purchase register
     # -------------------------------------------------------------------------------------------------
     con = duckdb.connect()
     con.register("gstr2b", store.read_parquet(gstr2b_key))
     con.register("pr", store.read_parquet(pr_key))
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 2 - FILTER + FORMULA: the two sides of the reconciliation, in the same shape
+    # STEP 2 - The two sides of the reconciliation, in the same shape
     #   invoice_key = invoice number without "/", "-", spaces, in upper case
     # -------------------------------------------------------------------------------------------------
     con.execute("""
@@ -181,7 +192,7 @@ def run(period: str, local_dir: str = None) -> dict:
     print(f"  GSTR-2B lines: {left_count} | purchase register lines (validated): {right_count}")
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 3 - JOIN LADDER: level 1, 2, 3 (each on what is still unmatched)
+    # STEP 3 - Matching ladder: level 1, 2, 3 (each level only sees what is still unmatched)
     # -------------------------------------------------------------------------------------------------
     same_parties = "l.recipient_gstin = r.recipient_gstin AND l.supplier_gstin = r.supplier_gstin"
     con.execute("CREATE TABLE matches (left_record_id VARCHAR, right_record_id VARCHAR, level_no INTEGER, match_level VARCHAR)")
@@ -193,7 +204,8 @@ def run(period: str, local_dir: str = None) -> dict:
                 f"{same_parties} AND abs(l.amount - r.amount) <= {AMOUNT_TOLERANCE_RS}")
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 4 - UNION: matched pairs (J) + 2B only (L) + PR only (R)
+    # STEP 4 - Stack matched pairs + 2B-only lines + PR-only lines into one table.
+    #   UNION ALL BY NAME matches columns by name; columns a part does not have become NULL.
     # -------------------------------------------------------------------------------------------------
     con.execute("""
         CREATE TABLE reco_union AS
@@ -208,19 +220,23 @@ def run(period: str, local_dir: str = None) -> dict:
         JOIN left_side  l ON l.record_id = m.left_record_id
         JOIN right_side r ON r.record_id = m.right_record_id
 
-        UNION ALL
-        SELECT 'Only in 2B', 4, l.record_id, NULL, l.recipient_gstin, l.supplier_gstin, l.supplier_name,
-               l.invoice_number, NULL, l.invoice_date, NULL, l.amount, NULL, l.tax, NULL
+        UNION ALL BY NAME
+        SELECT 'Only in 2B' AS match_level, 4 AS level_no,
+               l.record_id AS gstr2b_record_id, l.recipient_gstin, l.supplier_gstin, l.supplier_name,
+               l.invoice_number AS gstr2b_invoice_number, l.invoice_date AS gstr2b_invoice_date,
+               l.amount AS gstr2b_taxable_value, l.tax AS gstr2b_tax
         FROM left_side l WHERE l.record_id NOT IN (SELECT left_record_id FROM matches)
 
-        UNION ALL
-        SELECT 'Only in PR', 5, NULL, r.record_id, r.recipient_gstin, r.supplier_gstin, r.supplier_name,
-               NULL, r.invoice_number, NULL, r.invoice_date, NULL, r.amount, NULL, r.itc_claimed
+        UNION ALL BY NAME
+        SELECT 'Only in PR' AS match_level, 5 AS level_no,
+               r.record_id AS pr_record_id, r.recipient_gstin, r.supplier_gstin, r.supplier_name,
+               r.invoice_number AS pr_invoice_number, r.invoice_date AS pr_invoice_date,
+               r.amount AS pr_taxable_value, r.itc_claimed AS pr_itc_claimed
         FROM right_side r WHERE r.record_id NOT IN (SELECT right_record_id FROM matches)
     """)
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 5 - FORMULA: differences, ITC at risk and a remark per row
+    # STEP 5 - Differences, ITC at risk and a remark per row (final column list and types - Athena reads them)
     # -------------------------------------------------------------------------------------------------
     reco = con.execute("""
         SELECT match_level, CAST(level_no AS INTEGER) AS level_no,
@@ -248,7 +264,7 @@ def run(period: str, local_dir: str = None) -> dict:
     con.register("reco_result", reco)
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 6 - SUMMARIZE: counts, amounts and ITC at risk per match level, with every Record ID
+    # STEP 6 - Summary per match level: counts, amounts, ITC at risk and every Record ID
     # -------------------------------------------------------------------------------------------------
     summary = con.execute("""
         SELECT match_level                                              AS "Match Level",
@@ -266,7 +282,7 @@ def run(period: str, local_dir: str = None) -> dict:
     con.close()
 
     # -------------------------------------------------------------------------------------------------
-    # STEP 7 - OUTPUT
+    # STEP 7 - Write the outputs
     # -------------------------------------------------------------------------------------------------
     store.write_parquet(reco, reco_key)
     details = reco.to_pandas()
