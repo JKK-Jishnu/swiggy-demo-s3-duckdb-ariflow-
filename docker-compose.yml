@@ -1,0 +1,41 @@
+# Airflow (standalone: scheduler + webserver + triggerer in one container) for the Swiggy demo.
+# AWS credentials come from your local ~/.aws (set via `aws configure`), mounted read-only.
+#
+#   docker compose up -d        -> http://localhost:8080  (admin / admin)
+#   Port 8080 busy?  $env:AIRFLOW_PORT = "8081"; docker compose up -d
+#   docker compose logs -f
+#   docker compose down
+
+x-airflow-common:
+  &airflow-common
+  image: apache/airflow:2.9.3-python3.11
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+    AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: '30'
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: '30'
+    # Bootstrap the metadata DB and a fixed admin login before `standalone` starts
+    _AIRFLOW_DB_MIGRATE: 'true'
+    _AIRFLOW_WWW_USER_CREATE: 'true'
+    _AIRFLOW_WWW_USER_USERNAME: admin
+    _AIRFLOW_WWW_USER_PASSWORD: admin
+    _PIP_ADDITIONAL_REQUIREMENTS: 'duckdb==0.10.3 openpyxl pyarrow'
+    PYTHONPATH: /opt/airflow
+    AWS_DEFAULT_REGION: ap-south-1
+    S3_BUCKET: ${S3_BUCKET:-swiggy-idt-poc-bucket}
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./activities:/opt/airflow/activities
+    - ./pipeline:/opt/airflow/pipeline
+    - ./logs:/opt/airflow/logs
+    - ${USERPROFILE:-~}/.aws:/home/airflow/.aws:ro
+  user: "50000:0"
+
+services:
+  airflow-standalone:
+    <<: *airflow-common
+    command: standalone
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    restart: unless-stopped

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+logs/*
+!logs/.gitkeep
+activities/*/data/output/
+airflow.db
+standalone_admin_password.txt
