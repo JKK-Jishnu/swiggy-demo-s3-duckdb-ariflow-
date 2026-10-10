@@ -1,7 +1,8 @@
-# Airflow (standalone: scheduler + webserver + triggerer in one container) for the Swiggy demo.
-# AWS credentials come from your local ~/.aws (set via `aws configure`), mounted read-only.
+# Apache Airflow for the Swiggy GST pipelines.
+# One container in "standalone" mode (scheduler + webserver + triggerer) with a SQLite metadata DB.
+# AWS credentials come from your local ~/.aws (set with `aws configure`), mounted read-only.
 #
-#   docker compose up -d        -> http://localhost:8080  (admin / admin)
+#   docker compose up -d        -> http://localhost:8080   (admin / admin)
 #   Port 8080 busy?  $env:AIRFLOW_PORT = "8081"; docker compose up -d
 #   docker compose logs -f
 #   docker compose down
@@ -15,20 +16,20 @@ x-airflow-common:
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
     AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: '30'
     AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: '30'
-    # Bootstrap the metadata DB and a fixed admin login before `standalone` starts
+    # create the metadata DB and a fixed admin login before `standalone` starts
     _AIRFLOW_DB_MIGRATE: 'true'
     _AIRFLOW_WWW_USER_CREATE: 'true'
     _AIRFLOW_WWW_USER_USERNAME: admin
     _AIRFLOW_WWW_USER_PASSWORD: admin
+    # extra Python packages the jobs need (same versions as requirements.txt)
     _PIP_ADDITIONAL_REQUIREMENTS: 'duckdb==0.10.3 openpyxl pyarrow'
     PYTHONPATH: /opt/airflow
     AWS_DEFAULT_REGION: ap-south-1
     S3_BUCKET: ${S3_BUCKET:-swiggy-idt-poc-bucket}
   volumes:
-    - ./dags:/opt/airflow/dags
-    - ./activities:/opt/airflow/activities
-    - ./pipeline:/opt/airflow/pipeline
-    - ./logs:/opt/airflow/logs
+    - ./dags:/opt/airflow/dags                 # the 3 DAGs
+    - ./activities:/opt/airflow/activities     # the 9 jobs the DAGs call
+    - ./logs:/opt/airflow/logs                 # task logs, kept on the host
     - ${USERPROFILE:-~}/.aws:/home/airflow/.aws:ro
   user: "50000:0"
 

@@ -1,9 +1,17 @@
 """
-swiggy_gstr1_combine_reco_dag.py
-DAG 2 — Combine all batches + EINV/EWB reconciliation (Activities 4-6)
-Auto-triggered by DAG 1 (conf={"period": ...}) when all batches complete
+=====================================================================================================
+DAG 2    : swiggy_gstr1_combine_reco_dag             GSTR-1 track, one run per month
+-----------------------------------------------------------------------------------------------------
+TRIGGER  : started by DAG 1 when the last batch of the month is done (conf {"period": "202506"}),
+           or manually in the Airflow UI with config {"period": "202506"}
 
-combine_batches → [einv_vs_sales_reco ∥ ewb_vs_sales_reco] → generate_summary
+FLOW
+  combine_batches                Activity 4 - all batches -> one sales dataset
+     -> einv_vs_sales_reco       Activity 5 - e-invoice (IRN) vs sales      } run in parallel
+     -> ewb_vs_sales_reco        Activity 6 - e-way bill vs sales           }
+
+Each task only calls the job's run() function - all business logic lives in activities/<job>/job.py
+=====================================================================================================
 """
 import sys
 from datetime import datetime
@@ -15,42 +23,38 @@ sys.path.insert(0, "/opt/airflow")
 
 
 def _period(context) -> str:
+    """Period from the trigger config (DAG 1) or, for a manual run, from the DAG params."""
     conf = context["dag_run"].conf or {}
     return conf.get("period") or context["params"]["period"]
 
 
 def combine_batches(**context):
-    from pipeline import steps
-    return steps.combine(_period(context))
+    from activities.combine_batches.job import run
+    return run(_period(context))
 
 
 def einv_vs_sales_reco(**context):
-    from pipeline import steps
-    return steps.einv_reco(_period(context))
+    from activities.einv_vs_sales_reco.job import run
+    return run(_period(context))
 
 
 def ewb_vs_sales_reco(**context):
-    from pipeline import steps
-    return steps.ewb_reco(_period(context))
-
-
-def generate_summary(**context):
-    from pipeline import steps
-    return steps.gstr1_summary(_period(context))
+    from activities.ewb_vs_sales_reco.job import run
+    return run(_period(context))
 
 
 with DAG(
     dag_id="swiggy_gstr1_combine_reco_dag",
-    start_date=datetime(2026, 10, 1),
+    description="GSTR-1 per month: combine batches, EINV and EWB reconciliation",
+    start_date=datetime(2025, 4, 1),
     schedule=None,
     catchup=False,
     params={"period": "202506"},
-    tags=["swiggy", "gstr1", "combine", "reco"],
+    tags=["swiggy", "gstr1", "reco"],
 ) as dag:
 
-    t1 = PythonOperator(task_id="combine_batches",    python_callable=combine_batches)
-    t2 = PythonOperator(task_id="einv_vs_sales_reco", python_callable=einv_vs_sales_reco)
-    t3 = PythonOperator(task_id="ewb_vs_sales_reco",  python_callable=ewb_vs_sales_reco)
-    t4 = PythonOperator(task_id="generate_summary",   python_callable=generate_summary)
+    t_combine = PythonOperator(task_id="combine_batches",    python_callable=combine_batches)
+    t_einv    = PythonOperator(task_id="einv_vs_sales_reco", python_callable=einv_vs_sales_reco)
+    t_ewb     = PythonOperator(task_id="ewb_vs_sales_reco",  python_callable=ewb_vs_sales_reco)
 
-    t1 >> [t2, t3] >> t4
+    t_combine >> [t_einv, t_ewb]

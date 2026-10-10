@@ -1,125 +1,263 @@
-# Swiggy GST Automation Demo — DuckDB + S3 + Airflow
+# Swiggy GST Automation
 
-Proof of concept for replacing Alteryx + VDI GST workflows with Python, DuckDB, AWS S3 and Apache Airflow.
-All 9 monthly Swiggy GST activities run over **3 months of data** (202504, 202505, 202506) kept permanently in S3.
+The monthly GST compliance work for Swiggy runs as Python + DuckDB jobs, orchestrated by Apache Airflow.
+All data is kept in Amazon S3, and every month of history can be queried in Amazon Athena.
+
+| Track | What it produces |
+|---|---|
+| **GSTR-1** (sales) | Validated sales register, client corrections applied, GSTN upload file, EINV and EWB reconciliations |
+| **PR / GSTR-2B** (purchases) | Validated purchase register, consolidated GSTR-2B, 2B vs PR reconciliation with ITC at risk |
+
+History in Athena starts with return period **202504** (April 2025).
+
+---
+
+## 1. How a month runs
 
 ```
-raw/<period>/ (client Excel) → DuckDB → intermediate/<period>/ (parquet) → final/<period>/ (Excel for client)
-                                                    └── one DuckDB query across every month (history)
+Client uploads (S3 raw/<period>/)
+│
+├── GSTR-1 track
+│     DAG 1  swiggy_gstr1_batch_dag          once per batch (B1, B2, ... as listed in manifest.json)
+│            1 GSTR-1 validation ─► 2 error fixing ─► 1 re-validation ─► 3 upload file ─► mark batch done
+│            when every batch in the manifest is done ─► starts DAG 2
+│     DAG 2  swiggy_gstr1_combine_reco_dag   once per month
+│            4 combine batches ─► 5 EINV vs sales reco
+│                              └► 6 EWB  vs sales reco
+│
+└── PR / GSTR-2B track
+      DAG 3  swiggy_2b_pr_dag                once per month
+             7 PR validation    ─┐
+             8 2B consolidation ─┴► 9 2B vs PR reco
 ```
 
-## Prerequisites
-- Python 3.11+: `pip install -r requirements.txt`
-- AWS CLI configured (`aws configure`, region `ap-south-1`). Airflow reuses `~/.aws` read-only.
-- Docker Desktop running
-- S3 bucket `swiggy-idt-poc-bucket` (override with env var `S3_BUCKET`)
+Outputs per month:
+- `intermediate/<table>/period=<period>/`: parquet files with every line, used by the next job and by Athena.
+- `final/<period>/`: Excel files for the client and for the GSTN portal.
 
-## Run it
+---
 
+## 2. The jobs
+
+Each job is **one self-contained file**, `activities/<job>/job.py`. It holds everything the job needs:
+- column mappings and rules
+- reading and writing S3
+- the transformation steps
+
+Jobs share no code, so changing one job can never break another.
+
+| # | Job (folder) | Runs | Input → Output | Alteryx equivalent |
+|---|---|---|---|---|
+| 1 | `gstr1_validation` | per batch, twice | sales register → `gstr1_validated` / `gstr1_final` + error Excel | Input → Select → Formula per rule → Filter → Output |
+| 2 | `gstr1_error_fixing` | per batch | register + client corrections → corrected register + change log | Join on Record ID → Formula → Output |
+| 3 | `gstr1_upload_file_creation` | per batch | final lines → GSTN upload Excel (b2b, b2cl, b2cs, cdnr, cdnur, exp, hsn, docs) | Filter → Summarize → Select → Output |
+| 4 | `combine_batches` | per month | all batches → `sales_combined` (duplicate flags) | Directory → Union → Formula |
+| 5 | `einv_vs_sales_reco` | per month | EINV (IRN) vs sales → reco Excel | Join ladder → Union J/L/R → Summarize |
+| 6 | `ewb_vs_sales_reco` | per month | EWB vs sales → reco Excel | Join ladder → Union J/L/R → Summarize |
+| 7 | `pr_validation` | per month | purchase register → `pr_validated` + error Excel | Input → Select → Formula per rule → Filter |
+| 8 | `gstr2b_consolidation` | per month | 2B workbooks (B2B + CDNR sheets) → `gstr2b_consolidated` | Dynamic Input → Select → Union |
+| 9 | `gstr2b_vs_pr_reco` | per month | 2B vs PR → reco Excel with ITC at risk | Join ladder → Union J/L/R → Summarize |
+
+The header of every `job.py` lists:
+- what the job does and its Alteryx equivalent
+- exact input and output paths
+- every validation rule (R01–R18 for GSTR-1, P01–P17 for purchases)
+- how to run it
+
+### Reconciliation ladder (jobs 5, 6, 9)
+
+Each level only looks at rows that no earlier level matched. A row is matched at most once.
+
+| Level | Match on | Meaning |
+|---|---|---|
+| L1 Exact | GSTIN + invoice number + taxable value (±Rs.1) | fully matched |
+| L2 Amount mismatch | GSTIN + invoice number | same document, different amount |
+| L3 Invoice no mismatch | GSTIN + taxable value (±Rs.1) | same amount, invoice number typed differently |
+| Only in … | — | present on one side only |
+
+Invoice numbers are compared without `/`, `-` and spaces and ignoring case, so `SWG/2506/00012` = `SWG-2506-00012`.
+2B vs PR matching also requires the same Swiggy GSTIN.
+
+---
+
+## 3. Record IDs: tracing a line through every file
+
+Every input line carries a **Record ID** from the client file onwards. Jobs never change it, so the same ID is the lookup key in every later file and in Athena.
+
+| Source | Format | Example |
+|---|---|---|
+| Sales register (GSTR-1) | `sales-<period>-<type>-<n>` | `sales-202506-b2b-1`, `sales-202506-b2c-1` |
+| Purchase register | `pr-<period>-<n>` | `pr-202506-1` |
+| GSTR-2B | `2b-<period>-<n>` | `2b-202506-10` |
+| E-invoice (IRN) | `einv-<period>-<n>` | `einv-202506-3` |
+| E-way bill | `ewb-<period>-<n>` | `ewb-202506-7` |
+
+Where lines are **summed** (upload file sections b2cs, hsn and docs, and every reconciliation Summary sheet), the IDs of all lines behind the figure are joined with ` | ` in the Record ID column.
+
+How to trace a line:
+
+| You want | Look at |
+|---|---|
+| A sales line's whole journey (first validation → correction → final status → upload section → EINV / EWB match) | `SELECT * FROM swiggy_gst.v_sales_record_trace WHERE record_id = 'sales-202506-b2b-1'` |
+| The upload file rows built from a sales line | `athena/queries/02_find_record_in_upload_file.sql` |
+| A purchase line and its 2B match | `SELECT * FROM swiggy_gst.v_purchase_record_trace WHERE record_id = 'pr-202506-1'` |
+| The same, in Excel | filter the `Record ID(s)` / `*_record_id` columns of any output file |
+
+Validation outputs also keep `source_row_number`, the row of the line in the client's Excel file.
+
+---
+
+## 4. S3 layout
+
+Bucket `swiggy-idt-poc-bucket` (ap-south-1):
+
+```
+raw/<period>/                                    client uploads - never modified
+    gstr1/manifest.json                          {"total_batches": 3, "batches": ["B1","B2","B3"]}
+    gstr1/<batch>/gstr1_<batch>.xlsx             sales register        (sheet "Sales Register")
+    gstr1/<batch>/corrections_<batch>.xlsx       client corrections    (sheet "Corrections", keyed by Record ID)
+    gstr1/<batch>/trigger_<batch>.json           upload-complete signal for DAG 1
+    einv_bolton/einv_bolton.xlsx                 IRN data              (sheet "EINV")
+    ewb_bolton/ewb_bolton.xlsx                   e-way bills           (sheet "EWB")
+    pr/purchase_register.xlsx                    purchase register     (sheet "Purchase Register")
+    2b_bolton/2b_<GSTIN>.xlsx                    GSTR-2B per Swiggy GSTIN (sheets "B2B", "CDNR")
+
+intermediate/<table>/period=<period>/*.parquet   one folder per Athena table (see section 6)
+intermediate/gstr1_corrected/ ...                corrected register (internal hand-over 2 -> 1)
+intermediate/gstr1_final/ ...                    re-validated lines per batch (internal hand-over 1 -> 3, 4)
+
+batch_status/<period>/<batch>.done               written by DAG 1 when a batch is finished
+
+final/<period>/gstr1/<batch>_errors_for_client.xlsx          first validation errors -> client
+final/<period>/gstr1/<batch>_corrections_log.xlsx            every field the client corrected (old / new)
+final/<period>/gstr1/<batch>_errors_after_correction.xlsx    still wrong after corrections
+final/<period>/gstr1/<batch>_gstr1_upload.xlsx               GSTN offline-tool upload file
+final/<period>/einv_vs_sales_reco.xlsx                       Summary + Reco Details
+final/<period>/ewb_vs_sales_reco.xlsx
+final/<period>/pr_errors_for_client.xlsx
+final/<period>/gstr2b_vs_pr_reco.xlsx
+
+athena-results/                                  Athena query results
+```
+
+---
+
+## 5. Running the pipelines
+
+### Setup (once)
 ```powershell
-# 1. Generate 3 months of inputs (sample_data\raw\...) and upload them to S3 raw/
-python pipeline\create_sample_data.py              # or --periods 202506, or --no-upload
-
-# 2. Validate one batch locally (no S3, no Airflow) -> output\202506\gstr1_validated_B1.xlsx
-python activities\gstr1_validation\src\test_local.py --period 202506 --batch B1
-
-# 3. All 9 activities for every month from S3, then the cross-month history query (~30 s)
-python pipeline\run_demo.py                        # or --periods 202506
-
-# 4. Airflow (first start takes ~2 min while it installs duckdb)
-docker compose up -d                               # http://localhost:8080  admin / admin
+pip install -r requirements.txt
+aws configure                           # region ap-south-1
+docker compose up -d                    # Airflow at http://localhost:8080 (admin / admin)
 # port 8080 busy?  $env:AIRFLOW_PORT = "8081"; docker compose up -d
+python athena/athena.py setup           # Glue database, tables and views for Athena
 ```
 
-In Airflow:
-1. Trigger `swiggy_gstr1_batch_dag` once per batch with config `{"period": "202505", "batch_id": "B1"}`, then B2, B3 and B4.
-   The manifest for 202505 says 4 batches. After B4, DAG 1 starts `swiggy_gstr1_combine_reco_dag` automatically.
-2. Trigger `swiggy_2b_pr_dag` with `{"period": "202505"}`.
+### Monthly run (Airflow)
+1. For each batch the client uploads, trigger **`swiggy_gstr1_batch_dag`** with config `{"period": "202506", "batch_id": "B1"}`.
+   DAG 2 starts by itself after the last batch in the manifest.
+2. When the purchase register and the GSTR-2B files are in `raw/<period>/`, trigger **`swiggy_2b_pr_dag`** with `{"period": "202506"}`.
 
-To re-run the Airflow demo for a month, clear its batch markers first. `run_demo.py` also writes them.
+### Re-run a month (DAG 1 again)
+Delete the month's batch markers first. Otherwise DAG 2 starts after the first batch:
 ```powershell
-aws s3 rm s3://swiggy-idt-poc-bucket/batch_status/202505/ --recursive
+aws s3 rm s3://swiggy-idt-poc-bucket/batch_status/202506/ --recursive
 ```
 
-## Months in the sample data
-
-| Period | Batches (rows) | Notes |
-|---|---|---|
-| 202504 | B1 (18), B2 (12) | |
-| 202505 | B1 (25), B2 (20), B3 (15), B4 (10) | biggest month |
-| 202506 | B1 (20), B2 (15), B3 (10) | |
-
-The data is reproducible: each month uses a fixed random seed. When run, the generator prints what it planted:
-- GSTR1 errors, and how many of them the client corrects
-- EINV/EWB/2B rows that are dropped, have changed amounts or have typos in the invoice number
-- records that exist only in EINV, EWB or 2B
-
-The reco outputs should show exactly these numbers.
-
-## Activities
-
-| # | Activity | Module | Input → Output |
-|---|---|---|---|
-| 1 | GSTR1 validation | `activities/gstr1_validation` | `gstr1_Bx.xlsx` → `Bx_validated.parquet`, `Bx_errors_for_client.xlsx` |
-| 2 | GSTR1 error fixing | `activities/gstr1_error_fixing` | + `corrections_Bx.xlsx` → `Bx_fixed.parquet` (revalidated) |
-| 3 | Upload file creation | `activities/gstr1_upload_file_creation` | → `Bx_upload_file.xlsx` (B2B, B2CS, CDNR, CDNUR, EXP) |
-| 4 | Combine batches | `activities/combine_batches` | all `Bx_fixed` → `combined_sales.parquet` |
-| 5 | EINV vs sales reco | `activities/einv_vs_sales_reco` | `einv_bolton.xlsx` → `einv_vs_sales_reco.xlsx` |
-| 6 | EWB vs sales reco | `activities/ewb_vs_sales_reco` | `ewb_bolton.xlsx` → `ewb_vs_sales_reco.xlsx` |
-| 7 | PR validation | `activities/pr_validation` | `purchase_register.xlsx` → `pr_validated.parquet`, `pr_errors_for_client.xlsx` |
-| 8 | 2B consolidation | `activities/gstr2b_consolidation` | `2b_<GSTIN>.xlsx` × N (B2B + CDNR sheets) → `2b_consolidated.parquet` |
-| 9 | 2B vs PR reco | `activities/gstr2b_vs_pr_reco` | → `2b_vs_pr_reco.xlsx` |
-
-Each activity has `src/transformation.py` with a pure `run(...) -> dict` (DataFrames in, DataFrames out, no S3).
-[pipeline/steps.py](pipeline/steps.py) wraps each one with S3 reads and writes. Both `run_demo.py` and the DAGs call these same steps.
-
-**Reconciliation ladder** ([activities/common/ladder_match.py](activities/common/ladder_match.py), DuckDB). Each level matches only the rows left unmatched by the levels before it:
-
-| Level | Keys | Catches |
-|---|---|---|
-| L1 Exact | GSTIN + normalised invoice no + amount ±1 | `SWG/202506/B1001` = `SWG-202506-B1001` |
-| L2 GSTIN+Invoice | GSTIN + normalised invoice no | amount differences |
-| L3 GSTIN+Amount | GSTIN + amount ±1 | typos in the invoice number |
-| Only in X | — | missing on the other side |
-
-## DAGs
-
-| DAG | Trigger | Tasks |
-|---|---|---|
-| `swiggy_gstr1_batch_dag` | per batch (`period`, `batch_id`) | read_manifest → gstr1_validation → gstr1_error_fixing → gstr1_upload_file_creation → mark_batch_complete → check_all_batches_done → trigger_combine_dag \| wait_for_more_batches |
-| `swiggy_gstr1_combine_reco_dag` | DAG 1, when the `.done` count equals the manifest | combine_batches → [einv_vs_sales_reco ∥ ewb_vs_sales_reco] → generate_summary |
-| `swiggy_2b_pr_dag` | manual (`period`) | [pr_validation ∥ gstr2b_consolidation] → gstr2b_vs_pr_reco → generate_summary |
-
-## S3 layout (per period)
-
-```
-raw/<p>/gstr1/manifest.json                    {"total_batches": N}
-raw/<p>/gstr1/Bx/gstr1_Bx.xlsx, corrections_Bx.xlsx, trigger_Bx.json
-raw/<p>/einv_bolton/einv_bolton.xlsx
-raw/<p>/ewb_bolton/ewb_bolton.xlsx
-raw/<p>/pr/purchase_register.xlsx
-raw/<p>/2b_bolton/2b_<GSTIN>.xlsx
-
-intermediate/<p>/gstr1/Bx_validated.parquet, Bx_fixed.parquet
-intermediate/<p>/combined_sales.parquet, einv.parquet, ewb.parquet, pr_validated.parquet, 2b_consolidated.parquet
-intermediate/<p>/reco/einv_vs_sales.parquet, ewb_vs_sales.parquet, 2b_vs_pr.parquet
-
-batch_status/<p>/Bx.done
-
-final/<p>/gstr1/Bx_upload_file.xlsx, Bx_errors_for_client.xlsx
-final/<p>/einv_vs_sales_reco.xlsx, ewb_vs_sales_reco.xlsx, 2b_vs_pr_reco.xlsx, pr_errors_for_client.xlsx
-final/<p>/summaries/gstr1_summary.xlsx, pr_2b_summary.xlsx
+### Run outside Airflow
+```powershell
+python -m activities.gstr1_validation.job --period 202506 --batch B1     # one job
+python scripts/run_month.py --period 202506                              # every job of a month, DAG order
 ```
 
-Every parquet file has a `period` column, so the history can be queried across months: in `steps.cross_month_analysis()` today, and later in Athena.
-
-## Repo layout
+### Test on a local copy (no changes in S3)
+Every job accepts `--local-dir <folder>`. It then reads and writes the same paths inside that folder instead of the bucket:
+```powershell
+aws s3 sync s3://swiggy-idt-poc-bucket/raw/202506 data/raw/202506
+python scripts/run_month.py --period 202506 --local-dir data
 ```
-activities/<activity>/src/transformation.py   9 activities + common/ (GST utils, ladder match, sales reco)
-pipeline/       create_sample_data.py, steps.py (S3 step per task), run_demo.py, write_to_s3.py
-dags/           3 Airflow DAGs
-sample_data/raw/<period>/...   local mirror of S3 raw/ (committed)
-docker-compose.yml             Airflow 2.9 standalone
+(`data/` is git-ignored.)
+
+---
+
+## 6. History in Athena
+
+`python athena/athena.py setup` creates:
+- workgroup **`swiggy-gst`**
+- Glue database **`swiggy_gst`**
+- one table per job output, with column descriptions visible in the Glue console
+
+Every table has a partition column `period` (YYYYMM). New months show up automatically through partition projection, so no crawler or `MSCK REPAIR` is needed.
+
+| Table | One row per |
+|---|---|
+| `gstr1_validated` | sales line, first validation (as the client uploaded it) |
+| `sales_combined` | sales line, after corrections and re-validation, all batches |
+| `gstr1_upload_file` | upload file row (`section` = b2b, b2cl, b2cs, cdnr, cdnur, exp, hsn, docs) |
+| `einv_records` / `ewb_records` | IRN / e-way bill |
+| `einv_vs_sales_reco` / `ewb_vs_sales_reco` | matched pair or unmatched line |
+| `pr_validated` | purchase line with validation result |
+| `gstr2b_consolidated` | GSTR-2B line |
+| `gstr2b_vs_pr_reco` | matched pair or unmatched line, with `itc_at_risk` |
+
+| View | Shows |
+|---|---|
+| `v_gstr1_monthly_summary` | per month: lines, errors found, corrected, still open, value uploaded |
+| `v_reco_monthly_summary` | per month × reconciliation × match level: counts, differences, ITC at risk |
+| `v_itc_at_risk` | every purchase line with ITC not supported by GSTR-2B |
+| `v_sales_record_trace` | full journey of each sales Record ID |
+| `v_purchase_record_trace` | each purchase Record ID with its 2B match |
+
+Ready-made queries live in [athena/queries/](athena/queries/). Run them in the Athena console (workgroup `swiggy-gst`) or from the command line:
+```powershell
+python athena/athena.py query athena/queries/03_gstr1_monthly_trend.sql
+python athena/athena.py query "SELECT * FROM swiggy_gst.v_itc_at_risk"
 ```
 
-Not in scope yet: email notifications, Athena/Glue setup, waiting for real client corrections between steps.
+---
+
+## 7. Notes for Alteryx developers
+
+Every `job.py` follows the same layout:
+
+```
+header block      what / inputs / outputs / rules / how to run
+CONFIGURATION     column mappings (= Select tool), valid codes, tolerances
+STORAGE           read/write S3 or a local folder (= Input Data / Output Data tools)
+run()             STEP 1, STEP 2, ... - each step is one "tool", with a comment saying which
+```
+
+| Alteryx tool | In the code |
+|---|---|
+| Input Data | `store.read_excel_as_text(...)`. Every cell is read as text; numbers and dates are converted on purpose in the cleansing step |
+| Select | `COLUMN_MAP` (rename) and the final `SELECT` (column order and types) |
+| Data Cleansing | `trim`, `upper`, `NULLIF(x, '')`, `TRY_CAST(... AS DOUBLE)`, `try_strptime(...)` |
+| Formula | a SQL column: `CASE WHEN ... THEN ... END AS new_column` |
+| Filter | `WHERE ...` |
+| Join (J / L / R) | `JOIN`, plus `NOT IN (...)` for the unjoined left / right rows |
+| Summarize | `GROUP BY` with `sum()`, `count()`, `string_agg()` |
+| Union | `UNION ALL` / `pa.concat_tables` / `pd.concat` |
+| Output Data | `store.write_parquet(...)` (Athena) and `store.write_excel(...)` (client) |
+
+Each SQL step creates a named table (`CREATE TABLE cleaned AS ...`, `CREATE TABLE checked AS ...`), like the output anchor of a tool. To check an intermediate result while developing, `print(con.execute("SELECT * FROM checked LIMIT 20").df())`.
+
+**Adding a validation rule** (example in `gstr1_validation/job.py`):
+1. Add one line to the rules list in the header (`R19 ...`).
+2. Add one `COALESCE(<condition>, false) AS r19_ok` column in STEP 5.
+3. Add `+ CAST(NOT r19_ok AS INTEGER)` to `error_count` and a `CASE WHEN NOT r19_ok THEN 'R19 ...' END` line to the remark in STEP 6.
+
+---
+
+## 8. Repository layout
+
+```
+activities/<job>/job.py      the 9 jobs, one self-contained file each
+dags/                        the 3 Airflow DAGs (they only call job.run())
+scripts/run_month.py         run every job of a month without Airflow
+athena/athena.py             create Athena / Glue objects, run queries
+athena/tables/*.sql          one CREATE TABLE per job output
+athena/views/*.sql           summary and trace views
+athena/queries/*.sql         ready-made history queries
+docker-compose.yml           Airflow 2.9 (standalone)
+requirements.txt
+```

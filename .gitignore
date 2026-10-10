@@ -3,6 +3,6 @@ __pycache__/
 .env
 logs/*
 !logs/.gitkeep
-output/
+data/
 airflow.db
 standalone_admin_password.txt

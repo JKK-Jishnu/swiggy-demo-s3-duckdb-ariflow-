@@ -1,12 +1,20 @@
 """
-swiggy_2b_pr_dag.py
-DAG 3 — Purchase Register / GSTR-2B track (Activities 7-9), runs after GSTR1, usually manual
-Params : {period: "202506"}
+=====================================================================================================
+DAG 3    : swiggy_2b_pr_dag                          Purchase register / GSTR-2B track, per month
+-----------------------------------------------------------------------------------------------------
+TRIGGER  : manually in the Airflow UI with config {"period": "202506"},
+           once the purchase register and the GSTR-2B downloads for the month are in raw/
 
-[pr_validation ∥ gstr2b_consolidation] → gstr2b_vs_pr_reco → generate_summary
+FLOW
+  pr_validation                  Activity 7 - validate the purchase register      } run in parallel
+  gstr2b_consolidation           Activity 8 - all 2B workbooks -> one table        }
+     -> gstr2b_vs_pr_reco        Activity 9 - GSTR-2B vs purchase register, ITC at risk
 
-pr_validation also exports final/<period>/pr_errors_for_client.xlsx. In production the
-team waits for client corrections before reco; for the demo the reco runs on the valid rows.
+  pr_validation also writes final/<period>/pr_errors_for_client.xlsx. If the client sends a
+  corrected purchase register, upload it to raw/<period>/pr/ and run this DAG again.
+
+Each task only calls the job's run() function - all business logic lives in activities/<job>/job.py
+=====================================================================================================
 """
 import sys
 from datetime import datetime
@@ -23,37 +31,32 @@ def _period(context) -> str:
 
 
 def pr_validation(**context):
-    from pipeline import steps
-    return steps.pr_validation(_period(context))
+    from activities.pr_validation.job import run
+    return run(_period(context))
 
 
 def gstr2b_consolidation(**context):
-    from pipeline import steps
-    return steps.gstr2b_consolidation(_period(context))
+    from activities.gstr2b_consolidation.job import run
+    return run(_period(context))
 
 
 def gstr2b_vs_pr_reco(**context):
-    from pipeline import steps
-    return steps.gstr2b_pr_reco(_period(context))
-
-
-def generate_summary(**context):
-    from pipeline import steps
-    return steps.pr_2b_summary(_period(context))
+    from activities.gstr2b_vs_pr_reco.job import run
+    return run(_period(context))
 
 
 with DAG(
     dag_id="swiggy_2b_pr_dag",
-    start_date=datetime(2026, 10, 1),
+    description="PR / GSTR-2B per month: validate PR, consolidate 2B, 2B vs PR reconciliation",
+    start_date=datetime(2025, 4, 1),
     schedule=None,
     catchup=False,
     params={"period": "202506"},
     tags=["swiggy", "pr", "gstr2b", "reco"],
 ) as dag:
 
-    t1 = PythonOperator(task_id="pr_validation",        python_callable=pr_validation)
-    t2 = PythonOperator(task_id="gstr2b_consolidation", python_callable=gstr2b_consolidation)
-    t3 = PythonOperator(task_id="gstr2b_vs_pr_reco",    python_callable=gstr2b_vs_pr_reco)
-    t4 = PythonOperator(task_id="generate_summary",     python_callable=generate_summary)
+    t_pr    = PythonOperator(task_id="pr_validation",        python_callable=pr_validation)
+    t_2b    = PythonOperator(task_id="gstr2b_consolidation", python_callable=gstr2b_consolidation)
+    t_reco  = PythonOperator(task_id="gstr2b_vs_pr_reco",    python_callable=gstr2b_vs_pr_reco)
 
-    [t1, t2] >> t3 >> t4
+    [t_pr, t_2b] >> t_reco
