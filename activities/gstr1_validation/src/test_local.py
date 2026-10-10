@@ -9,32 +9,33 @@ import sys
 import pandas as pd
 
 # Add repo root to path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..")))
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+sys.path.insert(0, REPO_ROOT)
 
 from activities.gstr1_validation.src.transformation import run
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch", default="B1", help="Batch ID: B1, B2, B3")
+    parser.add_argument("--period", default="202506", help="Period YYYYMM: 202504, 202505, 202506")
+    parser.add_argument("--batch", default="B1", help="Batch ID: B1, B2, ...")
     args = parser.parse_args()
 
-    batch = args.batch
-    base  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    batch, period = args.batch, args.period
 
-    input_path = os.path.join(base, "data", "input", batch, f"gstr1_{batch}.xlsx")
-    output_dir = os.path.join(base, "data", "output", batch)
+    input_path = os.path.join(REPO_ROOT, "sample_data", "raw", period, "gstr1", batch, f"gstr1_{batch}.xlsx")
+    output_dir = os.path.join(REPO_ROOT, "output", period)
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"\n{'='*50}")
-    print(f"GSTR1 VALIDATION — Batch {batch}")
+    print(f"GSTR1 VALIDATION — {period} Batch {batch}")
     print(f"{'='*50}")
     print(f"Input: {input_path}")
 
     df = pd.read_excel(input_path, sheet_name="GSTR1 Data")
     print(f"Rows read: {len(df)}")
 
-    result = run(df, batch_id=batch)
+    result = run(df, batch_id=batch, period=period)
 
     # Write Excel output
     out_path = os.path.join(output_dir, f"gstr1_validated_{batch}.xlsx")

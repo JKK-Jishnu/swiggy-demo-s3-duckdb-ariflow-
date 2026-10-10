@@ -1,9 +1,12 @@
 """
-run_demo.py — Full pipeline demo
-Swiggy GSTR1: S3 read → DuckDB validate → S3 write parquet → combine → summary
+run_demo.py — Full pipeline demo, all 9 activities, multiple months
+Per period:  S3 raw → DuckDB → S3 intermediate (parquet) → S3 final (Excel)
+At the end:  one DuckDB query across all months of history
 
-Run: python pipeline\\run_demo.py
+Run: python pipeline\\run_demo.py                      (all periods in sample data)
+     python pipeline\\run_demo.py --periods 202506
 """
+import argparse
 import os
 import sys
 
@@ -11,111 +14,71 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datetime import datetime
 
-import duckdb
 import pandas as pd
 
-from activities.gstr1_validation.src.transformation import run as validate
-from pipeline.write_to_s3 import BUCKET, read_excel, s3_client, write_parquet
+from pipeline import steps
+from pipeline.create_sample_data import PERIODS
+from pipeline.write_to_s3 import BUCKET
 
-PERIOD  = "202506"
-BATCHES = ["B1", "B2", "B3"]
+pd.set_option("display.width", 200)
+pd.set_option("display.max_columns", 20)
 
 
 def print_header(text):
-    print(f"\n{'='*60}")
+    print(f"\n{'='*70}")
     print(f"  {text}")
-    print(f"{'='*60}")
+    print(f"{'='*70}")
+
+
+def run_period(period: str):
+    print_header(f"PERIOD {period}")
+    manifest = steps.read_manifest(period)
+    batches  = [f"B{i}" for i in range(1, manifest["total_batches"] + 1)]
+    print(f"  Manifest: {manifest['total_batches']} batches")
+
+    print("\n-- GSTR1 track: per batch (DAG 1) --")
+    for b in batches:
+        v = steps.validate_batch(period, b)                # Activity 1
+        f = steps.fix_batch(period, b)                     # Activity 2
+        u = steps.create_upload_file(period, b)            # Activity 3
+        steps.mark_batch_done(period, b)
+        print(f"  {b}: {v['rows']} rows | {v['errors']} errors → {f['fixed']} fixed, "
+              f"{f['still_errors']} open | upload sheets {u}")
+    done, total = steps.batch_progress(period)
+    print(f"  Batches done: {done}/{total}")
+
+    print("\n-- GSTR1 track: combine + reco (DAG 2) --")
+    print(f"  Combine: {steps.combine(period)}")                 # Activity 4
+    print(f"  EINV reco: {steps.einv_reco(period)}")             # Activity 5
+    print(f"  EWB reco : {steps.ewb_reco(period)}")              # Activity 6
+    steps.gstr1_summary(period)
+
+    print("\n-- PR / 2B track (DAG 3) --")
+    print(f"  PR validation: {steps.pr_validation(period)}")     # Activity 7
+    print(f"  2B consolidation: {steps.gstr2b_consolidation(period)}")  # Activity 8
+    print(f"  2B vs PR reco: {steps.gstr2b_pr_reco(period)}")    # Activity 9
+    print(f"  Summary: {steps.pr_2b_summary(period)}")
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--periods", nargs="+", default=list(PERIODS))
+    args = parser.parse_args()
+
     print_header("SWIGGY GST AUTOMATION DEMO")
-    print(f"Stack : DuckDB + AWS S3 + Apache Airflow + Python")
-    print(f"Client: Swiggy | Period: {PERIOD}")
-    print(f"Bucket: s3://{BUCKET}")
+    print(f"Stack  : DuckDB + AWS S3 + Apache Airflow + Python")
+    print(f"Bucket : s3://{BUCKET}")
+    print(f"Periods: {', '.join(args.periods)}")
 
-    s3 = s3_client()
-    all_results = []
+    for period in args.periods:
+        run_period(period)
 
-    # STEP 1: Process each batch
-    print_header("STEP 1: GSTR1 Validation (per batch)")
+    print_header("HISTORY: one DuckDB query across all months in S3")
+    print(steps.cross_month_analysis().to_string(index=False))
 
-    for batch in BATCHES:
-        print(f"\n  Processing {batch}...")
-
-        # Read from S3
-        key = f"raw/{PERIOD}/gstr1/{batch}/gstr1_{batch}.xlsx"
-        print(f"  Reading: s3://{BUCKET}/{key}")
-        df = read_excel(key, s3=s3)
-        print(f"  Rows fetched: {len(df)}")
-
-        # DuckDB validation
-        result = validate(df, batch_id=batch)
-        all_results.append(result["result"])
-        print(f"  DuckDB result: {len(result['success'])} success, {len(result['errors'])} errors")
-
-        # Write parquet to S3 intermediate
-        path = write_parquet(result["result"], f"intermediate/{PERIOD}/gstr1/{batch}_validated.parquet", s3=s3)
-        print(f"  Written parquet: {path}")
-
-        # Mark batch done
-        done_key = f"batch_status/{PERIOD}/{batch}.done"
-        s3.put_object(Bucket=BUCKET, Key=done_key, Body=b"done")
-        print(f"  Marked done: {done_key}")
-
-    # STEP 2: Combine batches
-    print_header("STEP 2: Combine All Batches")
-    combined = pd.concat(all_results, ignore_index=True)
-    print(f"  Combined rows: {len(combined)}")
-    print(f"  Batches included: {combined['batch_id'].unique().tolist()}")
-
-    path = write_parquet(combined, f"intermediate/{PERIOD}/combined_sales.parquet", s3=s3)
-    print(f"  Written: {path}")
-
-    # STEP 3: DuckDB query on combined data
-    print_header("STEP 3: DuckDB Analysis on Combined Data")
-    con = duckdb.connect()
-    con.register("combined", combined)
-
-    analysis = con.execute("""
-        SELECT
-            batch_id,
-            COUNT(*) as total_rows,
-            CAST(COUNT_IF(validation_status = 'Success') AS INTEGER) as success_count,
-            CAST(COUNT_IF(validation_status = 'Error') AS INTEGER)   as error_count,
-            ROUND(SUM(CASE WHEN validation_status = 'Success' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 1) as success_rate_pct,
-            ROUND(SUM(taxable_value), 2) as total_taxable_value
-        FROM combined
-        GROUP BY batch_id
-        ORDER BY batch_id
-    """).df()
-
-    print("\n  Batch-wise summary:")
-    print(analysis.to_string(index=False))
-
-    totals = con.execute("""
-        SELECT
-            COUNT(*) as total_rows,
-            CAST(COUNT_IF(validation_status = 'Success') AS INTEGER) as total_success,
-            CAST(COUNT_IF(validation_status = 'Error') AS INTEGER)   as total_errors,
-            ROUND(SUM(taxable_value), 2) as total_taxable_value
-        FROM combined
-    """).df()
-
-    # STEP 4: Final summary
-    print_header("DEMO COMPLETE — FINAL SUMMARY")
-    row = totals.iloc[0]
-    print(f"  Total rows processed  : {int(row['total_rows'])}")
-    print(f"  Success               : {int(row['total_success'])}")
-    print(f"  Errors                : {int(row['total_errors'])}")
-    print(f"  Total taxable value   : Rs.{row['total_taxable_value']:,.2f}")
-    print(f"\n  S3 outputs written:")
-    for batch in BATCHES:
-        print(f"    intermediate/{PERIOD}/gstr1/{batch}_validated.parquet")
-    print(f"    intermediate/{PERIOD}/combined_sales.parquet")
-    print(f"\n  All data queryable via AWS Athena anytime")
-    print(f"\n  {'='*60}")
-    print(f"  Demo complete at {datetime.now().strftime('%H:%M:%S')}")
-    print(f"  {'='*60}\n")
+    print(f"\n  Outputs per month: s3://{BUCKET}/intermediate/<period>/ (parquet, Athena-ready)")
+    print(f"                     s3://{BUCKET}/final/<period>/ (Excel for client)")
+    print(f"\n  Demo complete at {datetime.now().strftime('%H:%M:%S')}\n")
 
 
 if __name__ == "__main__":

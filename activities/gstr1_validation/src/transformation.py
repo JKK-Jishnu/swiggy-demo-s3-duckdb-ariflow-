@@ -4,38 +4,18 @@ Client   : Swiggy
 Activity : GSTR1 Validation (per batch)
 Stack    : DuckDB + pandas
 """
-import re
 from datetime import datetime
 
 import duckdb
 import pandas as pd
 from duckdb.typing import BOOLEAN, VARCHAR
 
+from activities.common.gst_utils import parse_dates, validate_gstin_format
+
 VALID_INVOICE_TYPES = ("B2B", "B2C", "CDNR", "CDNUR", "EXP")
-DATE_FORMATS        = ["%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%y"]
-GSTIN_PATTERN       = re.compile(r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$")
 
 
-def validate_gstin_format(gstin: str) -> bool:
-    """15 char GSTIN: 2 digit state + 10 char PAN + entity no. + Z + checksum char"""
-    if not gstin:
-        return False
-    gstin = str(gstin).strip().upper()
-    return len(gstin) == 15 and bool(GSTIN_PATTERN.match(gstin))
-
-
-def parse_dates(series: pd.Series) -> pd.Series:
-    """Try each known format in turn; unparseable values stay NaT."""
-    parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
-    for fmt in DATE_FORMATS:
-        missing = parsed.isna()
-        if not missing.any():
-            break
-        parsed[missing] = pd.to_datetime(series[missing].astype(str), format=fmt, errors="coerce")
-    return parsed
-
-
-def run(df: pd.DataFrame, batch_id: str = "B1", logger=None) -> dict:
+def run(df: pd.DataFrame, batch_id: str = "B1", period: str = None, logger=None) -> dict:
     """
     Main validation function. Uses DuckDB for SQL-based processing.
 
@@ -104,6 +84,7 @@ def run(df: pd.DataFrame, batch_id: str = "B1", logger=None) -> dict:
     """).df()
     con.close()
 
+    result_df["period"]       = period
     result_df["batch_id"]     = batch_id
     result_df["processed_at"] = datetime.now().isoformat()
 

@@ -1,10 +1,12 @@
 """
 swiggy_gstr1_batch_dag.py
-DAG 1 — Per batch GSTR1 validation pipeline
-Trigger: manually or via S3 event
+DAG 1 — Per batch GSTR1 pipeline (Activities 1-3)
+Trigger: manually or via S3 event (trigger_Bx.json)
 Params : {period: "202506", batch_id: "B1"}
+
+read_manifest → gstr1_validation → gstr1_error_fixing → gstr1_upload_file_creation
+  → mark_batch_complete → check_all_batches_done → trigger_combine_dag | wait_for_more_batches
 """
-import json
 import sys
 from datetime import datetime
 
@@ -16,59 +18,43 @@ from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 sys.path.insert(0, "/opt/airflow")
 
 
-def _read_manifest(s3, bucket, period) -> dict:
-    obj = s3.get_object(Bucket=bucket, Key=f"raw/{period}/gstr1/manifest.json")
-    return json.loads(obj["Body"].read())
+def _p(context):
+    return context["params"]["period"], context["params"]["batch_id"]
 
 
 def read_manifest(**context):
-    from pipeline.write_to_s3 import BUCKET, s3_client
-
-    manifest = _read_manifest(s3_client(), BUCKET, context["params"]["period"])
+    from pipeline import steps
+    manifest = steps.read_manifest(context["params"]["period"])
     print(f"Manifest: total_batches={manifest['total_batches']}")
     return manifest["total_batches"]
 
 
-def run_gstr1_validation(**context):
-    from activities.gstr1_validation.src.transformation import run
-    from pipeline.write_to_s3 import read_excel, write_parquet
+def gstr1_validation(**context):
+    from pipeline import steps
+    return steps.validate_batch(*_p(context))
 
-    period   = context["params"]["period"]
-    batch_id = context["params"]["batch_id"]
 
-    key = f"raw/{period}/gstr1/{batch_id}/gstr1_{batch_id}.xlsx"
-    df  = read_excel(key)
-    print(f"Read {len(df)} rows from {key}")
+def gstr1_error_fixing(**context):
+    from pipeline import steps
+    return steps.fix_batch(*_p(context))
 
-    result = run(df, batch_id=batch_id)
 
-    path = write_parquet(result["result"], f"intermediate/{period}/gstr1/{batch_id}_validated.parquet")
-    print(f"Written parquet: {path}")
-    return {"success": len(result["success"]), "errors": len(result["errors"])}
+def gstr1_upload_file_creation(**context):
+    from pipeline import steps
+    return steps.create_upload_file(*_p(context))
 
 
 def mark_batch_complete(**context):
-    from pipeline.write_to_s3 import BUCKET, s3_client
-
-    period   = context["params"]["period"]
-    batch_id = context["params"]["batch_id"]
-    s3_client().put_object(Bucket=BUCKET, Key=f"batch_status/{period}/{batch_id}.done", Body=b"done")
-    print(f"Marked {batch_id} as done")
+    from pipeline import steps
+    steps.mark_batch_done(*_p(context))
+    print(f"Marked {_p(context)[1]} as done")
 
 
 def check_all_batches_done(**context):
-    from pipeline.write_to_s3 import BUCKET, list_keys, s3_client
-
-    period = context["params"]["period"]
-    s3     = s3_client()
-
-    done_count = len(list_keys(f"batch_status/{period}/", ".done", s3=s3))
-    total      = _read_manifest(s3, BUCKET, period)["total_batches"]
-    print(f"Done: {done_count} / {total}")
-
-    if done_count >= total:
-        return "trigger_combine_dag"
-    return "wait_for_more_batches"
+    from pipeline import steps
+    done, total = steps.batch_progress(context["params"]["period"])
+    print(f"Done: {done} / {total}")
+    return "trigger_combine_dag" if done >= total else "wait_for_more_batches"
 
 
 with DAG(
@@ -80,15 +66,17 @@ with DAG(
     tags=["swiggy", "gstr1", "batch"],
 ) as dag:
 
-    t1 = PythonOperator(task_id="read_manifest",       python_callable=read_manifest)
-    t2 = PythonOperator(task_id="gstr1_validation",    python_callable=run_gstr1_validation)
-    t3 = PythonOperator(task_id="mark_batch_complete", python_callable=mark_batch_complete)
-    t4 = BranchPythonOperator(task_id="check_all_batches_done", python_callable=check_all_batches_done)
-    t5 = TriggerDagRunOperator(
+    t1 = PythonOperator(task_id="read_manifest",              python_callable=read_manifest)
+    t2 = PythonOperator(task_id="gstr1_validation",           python_callable=gstr1_validation)
+    t3 = PythonOperator(task_id="gstr1_error_fixing",         python_callable=gstr1_error_fixing)
+    t4 = PythonOperator(task_id="gstr1_upload_file_creation", python_callable=gstr1_upload_file_creation)
+    t5 = PythonOperator(task_id="mark_batch_complete",        python_callable=mark_batch_complete)
+    t6 = BranchPythonOperator(task_id="check_all_batches_done", python_callable=check_all_batches_done)
+    t7 = TriggerDagRunOperator(
         task_id="trigger_combine_dag",
         trigger_dag_id="swiggy_gstr1_combine_reco_dag",
         conf={"period": "{{ params.period }}"},
     )
-    t6 = EmptyOperator(task_id="wait_for_more_batches")
+    t8 = EmptyOperator(task_id="wait_for_more_batches")
 
-    t1 >> t2 >> t3 >> t4 >> [t5, t6]
+    t1 >> t2 >> t3 >> t4 >> t5 >> t6 >> [t7, t8]
